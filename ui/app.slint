@@ -1,0 +1,392 @@
+import { Button, LineEdit, ComboBox, CheckBox, ListView, ScrollView, TextEdit, SpinBox } from "std-widgets.slint";
+
+export struct RuleRow {
+    id: string,
+    name: string,
+    schedule: string,
+    shell: string,
+    status: string,
+    enabled: bool,
+    last-run: string,
+    next-run: string,
+    shell-missing: bool,
+}
+
+export struct RunRow {
+    id: string,
+    started: string,
+    finished: string,
+    status: string,
+    exit-code: string,
+    trigger: string,
+    stdout: string,
+    stderr: string,
+    success: bool,
+}
+
+export component MainWindow inherits Window {
+    title: "Cronch";
+    preferred-width: 1000px;
+    preferred-height: 680px;
+    min-width: 720px;
+    min-height: 480px;
+    background: #1e1e22;
+
+    // ---- data in from Rust ----
+    in property <[RuleRow]> rules;
+    in property <[RunRow]> runs;
+    in property <[string]> shell-options;
+    in property <int> custom-shell-index;
+    in property <int> direct-shell-index;
+    in property <bool> paused;
+    in property <string> logs-rule-name;
+
+    // ---- view state ----
+    in-out property <int> active-view: 0; // 0 list, 1 editor, 2 logs, 3 settings
+    in-out property <int> selected-run-index: 0;
+    in-out property <bool> show-first-run: false;
+
+    // ---- editor fields ----
+    in-out property <string> edit-id;
+    in-out property <string> edit-title: "New rule";
+    in-out property <string> edit-name;
+    in-out property <bool> edit-enabled: true;
+    in-out property <string> edit-command;
+    in-out property <int> edit-shell-index: 0;
+    in-out property <string> edit-custom-path;
+    in-out property <string> edit-custom-arg: "-c {cmd}";
+    in-out property <int> edit-schedule-mode: 0; // 0 interval, 1 cron, 2 once
+    in-out property <int> edit-interval-value: 5;
+    in-out property <int> edit-interval-unit: 1; // 0 sec 1 min 2 hour 3 day
+    in-out property <string> edit-cron: "0 9 * * *";
+    in-out property <string> edit-once;
+    in-out property <bool> edit-catch-up: true;
+    in-out property <int> edit-overlap: 0; // 0 skip 1 queue 2 parallel
+    in-out property <string> edit-working-dir;
+    in-out property <string> edit-env;
+    in-out property <string> edit-error;
+
+    // ---- settings fields ----
+    in-out property <bool> setting-autostart: true;
+    in-out property <int> setting-retention-days: 30;
+    in-out property <string> settings-status;
+
+    // ---- callbacks to Rust ----
+    callback request-add();
+    callback request-edit(string);
+    callback request-delete(string);
+    callback request-run-now(string);
+    callback request-toggle-enabled(string, bool);
+    callback request-open-logs(string);
+    callback save-rule();
+    callback cancel-edit();
+    callback request-settings();
+    callback save-settings();
+    callback export-rules();
+    callback import-rules();
+    callback pause-all();
+    callback resume-all();
+    callback dismiss-first-run();
+
+    VerticalLayout {
+        // ===== Header =====
+        Rectangle {
+            height: 56px;
+            background: #26262b;
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 18px;
+                spacing: 8px;
+                Text {
+                    text: "Cronch";
+                    color: #2dbfa8;
+                    font-size: 22px;
+                    font-weight: 800;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.paused ? "· paused" : "";
+                    color: #d08a2c;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: root.paused ? "Resume all" : "Pause all";
+                    clicked => { if (root.paused) { root.resume-all(); } else { root.pause-all(); } }
+                }
+                Button { text: "Settings"; clicked => { root.request-settings(); } }
+                Button { text: "+ Add rule"; clicked => { root.request-add(); } }
+            }
+        }
+
+        // ===== First-run banner =====
+        if root.show-first-run: Rectangle {
+            height: 40px;
+            background: #33414a;
+            HorizontalLayout {
+                padding-left: 18px;
+                padding-right: 18px;
+                spacing: 8px;
+                Text {
+                    text: "Cronch now launches at login so your schedules keep running. You can turn this off in Settings.";
+                    color: #cfe8ff;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                Button { text: "Got it"; clicked => { root.dismiss-first-run(); } }
+            }
+        }
+
+        // ===== Content =====
+        Rectangle {
+            vertical-stretch: 1;
+            background: #1e1e22;
+
+            // ---------- LIST ----------
+            if root.active-view == 0: VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                if root.rules.length == 0: Rectangle {
+                    Text {
+                        text: "No rules yet.\nClick “+ Add rule” to create your first scheduled task.";
+                        color: #888;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                ListView {
+                    for row in root.rules: Rectangle {
+                        height: 68px;
+                        background: touch.has-hover ? #2a2a30 : #232329;
+                        border-radius: 8px;
+                        touch := TouchArea {
+                            clicked => { root.request-edit(row.id); }
+                        }
+                        HorizontalLayout {
+                            padding: 12px;
+                            spacing: 12px;
+                            VerticalLayout {
+                                alignment: center;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: row.name;
+                                    color: #f0f0f2;
+                                    font-size: 15px;
+                                    font-weight: 700;
+                                }
+                                Text {
+                                    text: row.schedule + "  ·  " + row.shell + (row.shell-missing ? "  ·  ⚠ shell missing" : "");
+                                    color: row.shell-missing ? #e0703a : #8a8a93;
+                                    font-size: 12px;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                width: 150px;
+                                Text {
+                                    text: row.status;
+                                    color: row.status == "Success" ? #43c06a
+                                        : row.status == "Failed" ? #e05a4a
+                                        : row.status == "Running" ? #2dbfa8
+                                        : #a0a0a8;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    text: "next: " + row.next-run;
+                                    color: #77777f;
+                                    font-size: 11px;
+                                }
+                                Text {
+                                    text: "last: " + row.last-run;
+                                    color: #77777f;
+                                    font-size: 11px;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                cb := CheckBox {
+                                    text: "on";
+                                    checked: row.enabled;
+                                    toggled => { root.request-toggle-enabled(row.id, cb.checked); }
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 4px;
+                                Button { text: "Run now"; clicked => { root.request-run-now(row.id); } }
+                                HorizontalLayout {
+                                    spacing: 4px;
+                                    Button { text: "Logs"; clicked => { root.request-open-logs(row.id); } }
+                                    Button { text: "Delete"; clicked => { root.request-delete(row.id); } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------- EDITOR ----------
+            if root.active-view == 1: ScrollView {
+                VerticalLayout {
+                    padding: 18px;
+                    spacing: 10px;
+
+                    Text { text: root.edit-title; color: #f0f0f2; font-size: 18px; font-weight: 700; }
+
+                    Text { text: "Name"; color: #a0a0a8; }
+                    LineEdit { placeholder-text: "e.g. Nightly backup"; text <=> root.edit-name; }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        CheckBox { text: "Enabled"; checked <=> root.edit-enabled; }
+                        CheckBox { text: "Catch up if missed"; checked <=> root.edit-catch-up; }
+                    }
+
+                    Text { text: "Command"; color: #a0a0a8; }
+                    LineEdit { placeholder-text: "command or path to script"; text <=> root.edit-command; }
+
+                    Text { text: "Shell"; color: #a0a0a8; }
+                    ComboBox { model: root.shell-options; current-index <=> root.edit-shell-index; }
+                    if root.edit-shell-index == root.custom-shell-index: VerticalLayout {
+                        spacing: 6px;
+                        LineEdit { placeholder-text: "Shell binary path"; text <=> root.edit-custom-path; }
+                        LineEdit { placeholder-text: "Argument template — must contain {cmd}"; text <=> root.edit-custom-arg; }
+                    }
+
+                    Text { text: "Schedule"; color: #a0a0a8; }
+                    ComboBox { model: ["Interval", "Cron", "Once"]; current-index <=> root.edit-schedule-mode; }
+                    if root.edit-schedule-mode == 0: HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Every"; color: #ccc; vertical-alignment: center; }
+                        SpinBox { minimum: 1; maximum: 1000000; value <=> root.edit-interval-value; }
+                        ComboBox { model: ["seconds", "minutes", "hours", "days"]; current-index <=> root.edit-interval-unit; }
+                    }
+                    if root.edit-schedule-mode == 1: VerticalLayout {
+                        LineEdit { placeholder-text: "cron, e.g. 0 9 * * *  (min hour dom mon dow)"; text <=> root.edit-cron; }
+                        Text { text: "5-field standard cron (seconds assumed 0), or 6-field with seconds."; color: #777; font-size: 11px; }
+                    }
+                    if root.edit-schedule-mode == 2: LineEdit { placeholder-text: "YYYY-MM-DD HH:MM (local time)"; text <=> root.edit-once; }
+
+                    Text { text: "If already running"; color: #a0a0a8; }
+                    ComboBox { model: ["Skip", "Queue", "Parallel"]; current-index <=> root.edit-overlap; }
+
+                    Text { text: "Working directory (blank = home)"; color: #a0a0a8; }
+                    LineEdit { placeholder-text: root.edit-working-dir == "" ? "default: your home directory" : ""; text <=> root.edit-working-dir; }
+
+                    Text { text: "Environment variables (KEY=VALUE, one per line)"; color: #a0a0a8; }
+                    Rectangle {
+                        height: 90px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #3a3a42;
+                        TextEdit { text <=> root.edit-env; }
+                    }
+
+                    if root.edit-error != "": Text { text: root.edit-error; color: #e05a4a; }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        padding-top: 6px;
+                        Button { text: "Save"; clicked => { root.save-rule(); } }
+                        Button { text: "Cancel"; clicked => { root.cancel-edit(); } }
+                    }
+                }
+            }
+
+            // ---------- LOGS ----------
+            if root.active-view == 2: VerticalLayout {
+                padding: 14px;
+                spacing: 8px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "History — " + root.logs-rule-name; color: #f0f0f2; font-size: 16px; font-weight: 700; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Back"; clicked => { root.active-view = 0; } }
+                }
+                if root.runs.length == 0: Text { text: "No runs recorded yet."; color: #888; }
+                if root.runs.length > 0: HorizontalLayout {
+                    spacing: 10px;
+                    ListView {
+                        width: 340px;
+                        for run[idx] in root.runs: Rectangle {
+                            height: 56px;
+                            background: idx == root.selected-run-index ? #2f2f52 : (rt.has-hover ? #2a2a30 : #232329);
+                            border-radius: 6px;
+                            rt := TouchArea { clicked => { root.selected-run-index = idx; } }
+                            VerticalLayout {
+                                padding: 8px;
+                                Text {
+                                    text: run.started + "   " + run.status;
+                                    color: run.success ? #43c06a : (run.status == "Running" ? #2dbfa8 : #e05a4a);
+                                    font-weight: 600;
+                                }
+                                Text { text: "exit " + run.exit-code + "  ·  " + run.trigger; color: #77777f; font-size: 11px; }
+                            }
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        Text { text: "stdout"; color: #a0a0a8; font-weight: 700; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: #3a3a42;
+                            TextEdit {
+                                read-only: true;
+                                text: root.selected-run-index < root.runs.length ? root.runs[root.selected-run-index].stdout : "";
+                            }
+                        }
+                        Text { text: "stderr"; color: #a0a0a8; font-weight: 700; }
+                        Rectangle {
+                            vertical-stretch: 1;
+                            border-radius: 4px;
+                            border-width: 1px;
+                            border-color: #3a3a42;
+                            TextEdit {
+                                read-only: true;
+                                text: root.selected-run-index < root.runs.length ? root.runs[root.selected-run-index].stderr : "";
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------- SETTINGS ----------
+            if root.active-view == 3: VerticalLayout {
+                padding: 18px;
+                spacing: 12px;
+                HorizontalLayout {
+                    Text { text: "Settings"; color: #f0f0f2; font-size: 18px; font-weight: 700; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "Back"; clicked => { root.active-view = 0; } }
+                }
+                CheckBox { text: "Launch Cronch at login (recommended — jobs only fire while it runs)"; checked <=> root.setting-autostart; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Keep run history for"; color: #ccc; vertical-alignment: center; }
+                    SpinBox { minimum: 0; maximum: 3650; value <=> root.setting-retention-days; }
+                    Text { text: "days (0 = forever)"; color: #ccc; vertical-alignment: center; }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button { text: "Export rules…"; clicked => { root.export-rules(); } }
+                    Button { text: "Import rules…"; clicked => { root.import-rules(); } }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button { text: "Save settings"; clicked => { root.save-settings(); } }
+                    Text { text: root.settings-status; color: #43c06a; vertical-alignment: center; }
+                }
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: "Cronch — open-source task scheduler · made by burakov · burakov.net";
+                    color: #666;
+                    font-size: 11px;
+                }
+            }
+        }
+    }
+}
