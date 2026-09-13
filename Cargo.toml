@@ -40,3 +40,7 @@ uuid = { version = "1.26.0", features = ["v4", "serde"] }
 
 [build-dependencies]
 slint-build = "1.17.1"
+
+# Windows-only: embeds assets/icon.ico into the .exe (Explorer/taskbar icon).
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
