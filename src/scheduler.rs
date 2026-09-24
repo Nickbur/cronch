@@ -105,6 +105,9 @@ impl Engine {
     /// Compute and store the next fire time for a rule (with optional catch-up).
     fn arm_rule(&mut self, rule: Rule, catch_up: bool) {
         let id = rule.id;
+        // Honor the per-rule "Catch up if missed" toggle: engine catch-up (only
+        // ever true on startup) applies only when the rule itself opts in.
+        let catch_up = catch_up && rule.catch_up;
         if !rule.enabled {
             self.armed.remove(&id);
             self.rules.insert(id, rule);
