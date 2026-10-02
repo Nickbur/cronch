@@ -1,2 +1,7 @@
 /target
 .DS_Store
+
+# Editor: only the shared settings are versioned
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
