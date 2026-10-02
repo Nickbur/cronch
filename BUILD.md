@@ -39,15 +39,15 @@ Windows SDK. Install the **Visual Studio 2022 Build Tools** with the
 **"Desktop development with C++"** workload:
 
 - Download from <https://visualstudio.microsoft.com/downloads/> → "Tools for
-  Visual Studio" → **Build Tools for Visual Studio 2022**, or install from a
-  terminal:
+    Visual Studio" → **Build Tools for Visual Studio 2022**, or install from a
+    terminal:
 
-  ```powershell
-  winget install --id Microsoft.VisualStudio.2022.BuildTools -e
-  ```
+    ```powershell
+    winget install --id Microsoft.VisualStudio.2022.BuildTools -e
+    ```
 
-  In the installer, tick **Desktop development with C++** and install. (This
-  provides `link.exe`, the MSVC compiler, and the Windows SDK.)
+    In the installer, tick **Desktop development with C++** and install. (This
+    provides `link.exe`, the MSVC compiler, and the Windows SDK.)
 
 If you already have Visual Studio 2022 with the C++ workload, you can skip this.
 
@@ -106,16 +106,16 @@ window hides Cronch to the tray; quit it from the tray menu.
 ### Windows notes
 
 - **SmartScreen / antivirus:** an unsigned app that runs commands on a schedule
-  and starts at login looks, to Windows, a lot like malware. SmartScreen may
-  show "Windows protected your PC" — click **More info → Run anyway**. Since you
-  built it yourself from source, it is safe. To avoid this on a machine you
-  distribute to, sign the binary with a code-signing certificate.
+    and starts at login looks, to Windows, a lot like malware. SmartScreen may
+    show "Windows protected your PC" — click **More info → Run anyway**. Since you
+    built it yourself from source, it is safe. To avoid this on a machine you
+    distribute to, sign the binary with a code-signing certificate.
 - **Launch at login:** on first run Cronch enables itself to start at login
-  (a registry entry under `HKCU\...\Run`). You can turn this off in **Settings**
-  inside the app.
+    (a registry entry under `HKCU\...\Run`). You can turn this off in **Settings**
+    inside the app.
 - **Debug build:** `cargo build` (without `--release`) is faster to compile,
-  produces `target\debug\cronch.exe`, and prints logs to the console — handy if
-  something misbehaves.
+    produces `target\debug\cronch.exe`, and prints logs to the console — handy if
+    something misbehaves.
 
 ---
 
@@ -188,16 +188,16 @@ Closing the window hides Cronch to the menu bar; quit it from the menu.
 ### macOS notes
 
 - **Gatekeeper:** a binary you build and run locally from the terminal is **not**
-  quarantined, so Gatekeeper does not block it. (Quarantine only applies to
-  apps *downloaded* from the internet — those show "cannot be opened because the
-  developer cannot be verified", which you'd clear with **right-click → Open**,
-  or `xattr -dr com.apple.quarantine <path>`.) To ship to other Macs without
-  friction you'd sign and notarize the app.
+    quarantined, so Gatekeeper does not block it. (Quarantine only applies to
+    apps *downloaded* from the internet — those show "cannot be opened because the
+    developer cannot be verified", which you'd clear with **right-click → Open**,
+    or `xattr -dr com.apple.quarantine <path>`.) To ship to other Macs without
+    friction you'd sign and notarize the app.
 - **Launch at login:** on first run Cronch installs a **LaunchAgent** so it
-  starts at login. Turn it off in **Settings** inside the app.
+    starts at login. Turn it off in **Settings** inside the app.
 - **A plain binary, not a `.app`:** `cargo build` produces a Unix executable,
-  not a double-clickable `.app` bundle. That's all you need to run it. To make a
-  proper `.app`/`.dmg`, see "Distributable packages" below.
+    not a double-clickable `.app` bundle. That's all you need to run it. To make a
+    proper `.app`/`.dmg`, see "Distributable packages" below.
 
 ---
 
@@ -226,12 +226,12 @@ guide.
 ## Troubleshooting
 
 - **Windows: `error: linker 'link.exe' not found`** — the C++ build tools aren't
-  installed (or not the C++ workload). Redo Part 1, Step 1, making sure
-  **Desktop development with C++** is selected.
+    installed (or not the C++ workload). Redo Part 1, Step 1, making sure
+    **Desktop development with C++** is selected.
 - **Windows: linker errors when building from Git Bash / MSYS** — Git Bash ships
-  its own `/usr/bin/link.exe` that can shadow MSVC's linker. Build from
-  **PowerShell** or the **Developer Command Prompt** instead.
+    its own `/usr/bin/link.exe` that can shadow MSVC's linker. Build from
+    **PowerShell** or the **Developer Command Prompt** instead.
 - **macOS: `xcrun: error: invalid active developer path`** — the Command Line
-  Tools aren't installed. Run `xcode-select --install`.
+    Tools aren't installed. Run `xcode-select --install`.
 - **The first build seems stuck** — it isn't; compiling the GUI stack the first
-  time takes a few minutes. Subsequent builds are incremental and quick.
+    time takes a few minutes. Subsequent builds are incremental and quick.
