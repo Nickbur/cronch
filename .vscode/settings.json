@@ -1,0 +1,13 @@
+{
+    "[rust]": {
+        "editor.formatOnSave": true,
+        "editor.defaultFormatter": "rust-lang.rust-analyzer"
+    },
+    "editor.detectIndentation": false,
+    "editor.insertSpaces": true,
+    "editor.tabSize": 4,
+    "files.eol": "\n",
+    "[makefile]": {
+        "editor.insertSpaces": false
+    }
+}

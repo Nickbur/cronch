@@ -3,7 +3,7 @@
 use crate::model::{EnvVar, LastStatus, OverlapPolicy, Rule, RunRecord, Schedule, ShellKind};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS rules (
     last_run       TEXT,
     next_run       TEXT,
     last_exit_code INTEGER,
-    last_status    TEXT NOT NULL
+    last_status    TEXT NOT NULL,
+    timeout_secs   INTEGER NOT NULL DEFAULT 300
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -58,6 +59,24 @@ CREATE TABLE IF NOT EXISTS settings (
 
 fn dt_to_str(dt: &DateTime<Utc>) -> String {
     dt.to_rfc3339()
+}
+
+/// Apply the schema and migrate older databases (add columns added in later
+/// versions, with safe defaults).
+fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    // Databases created before the per-rule timeout existed lack this column.
+    let has_timeout: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('rules') WHERE name = 'timeout_secs'")?
+        .query_row([], |_| Ok(()))
+        .optional()?
+        .is_some();
+    if !has_timeout {
+        conn.execute_batch(
+            "ALTER TABLE rules ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300",
+        )?;
+    }
+    Ok(())
 }
 
 fn parse_dt(s: &str) -> Result<DateTime<Utc>> {
@@ -88,12 +107,12 @@ struct RawRule {
     next_run: Option<String>,
     last_exit_code: Option<i64>,
     last_status: String,
+    timeout_secs: i64,
 }
 
 impl RawRule {
     fn into_rule(self) -> Result<Rule> {
-        let shell: ShellKind =
-            serde_json::from_str(&self.shell).context("decode shell json")?;
+        let shell: ShellKind = serde_json::from_str(&self.shell).context("decode shell json")?;
         let schedule: Schedule =
             serde_json::from_str(&self.schedule).context("decode schedule json")?;
         let env: Vec<EnvVar> = serde_json::from_str(&self.env).context("decode env json")?;
@@ -113,11 +132,12 @@ impl RawRule {
             next_run: parse_opt_dt(self.next_run)?,
             last_exit_code: self.last_exit_code.map(|v| v as i32),
             last_status: LastStatus::from_str_lossy(&self.last_status),
+            timeout_secs: self.timeout_secs,
         })
     }
 }
 
-const RULE_COLUMNS: &str = "id,name,enabled,command,shell,schedule,catch_up,overlap,working_dir,env,created_at,last_run,next_run,last_exit_code,last_status";
+const RULE_COLUMNS: &str = "id,name,enabled,command,shell,schedule,catch_up,overlap,working_dir,env,created_at,last_run,next_run,last_exit_code,last_status,timeout_secs";
 
 fn map_raw_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRule> {
     Ok(RawRule {
@@ -136,6 +156,7 @@ fn map_raw_rule(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRule> {
         next_run: row.get(12)?,
         last_exit_code: row.get(13)?,
         last_status: row.get(14)?,
+        timeout_secs: row.get(15)?,
     })
 }
 
@@ -143,7 +164,7 @@ impl Store {
     pub fn open(path: &Path) -> Result<Store> {
         let conn = Connection::open(path)
             .with_context(|| format!("open sqlite db at {}", path.display()))?;
-        conn.execute_batch(SCHEMA).context("apply schema")?;
+        ensure_schema(&conn).context("apply schema")?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -152,7 +173,7 @@ impl Store {
     #[cfg(test)]
     pub fn open_in_memory() -> Result<Store> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        ensure_schema(&conn)?;
         Ok(Store {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -183,14 +204,15 @@ impl Store {
     pub fn upsert_rule(&self, rule: &Rule) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO rules (id,name,enabled,command,shell,schedule,catch_up,overlap,working_dir,env,created_at,last_run,next_run,last_exit_code,last_status)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+            "INSERT INTO rules (id,name,enabled,command,shell,schedule,catch_up,overlap,working_dir,env,created_at,last_run,next_run,last_exit_code,last_status,timeout_secs)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
              ON CONFLICT(id) DO UPDATE SET
                name=excluded.name, enabled=excluded.enabled, command=excluded.command,
                shell=excluded.shell, schedule=excluded.schedule, catch_up=excluded.catch_up,
                overlap=excluded.overlap, working_dir=excluded.working_dir, env=excluded.env,
                last_run=excluded.last_run, next_run=excluded.next_run,
-               last_exit_code=excluded.last_exit_code, last_status=excluded.last_status",
+               last_exit_code=excluded.last_exit_code, last_status=excluded.last_status,
+               timeout_secs=excluded.timeout_secs",
             params![
                 rule.id.to_string(),
                 rule.name,
@@ -207,6 +229,7 @@ impl Store {
                 rule.next_run.as_ref().map(dt_to_str),
                 rule.last_exit_code,
                 rule.last_status.as_str(),
+                rule.timeout_secs,
             ],
         )?;
         Ok(())
@@ -290,10 +313,12 @@ impl Store {
         Ok(())
     }
 
+    /// List recent runs WITHOUT stdout/stderr bodies (bounded memory; bodies
+    /// are fetched per-run via [`Store::get_run`] when actually shown).
     pub fn list_runs(&self, rule_id: Uuid, limit: i64) -> Result<Vec<RunRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, started_at, finished_at, exit_code, success, stdout, stderr, trigger
+            "SELECT id, started_at, finished_at, exit_code, success, trigger
              FROM runs WHERE rule_id = ?1 ORDER BY started_at DESC, id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![rule_id.to_string(), limit], |row| {
@@ -304,25 +329,79 @@ impl Store {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (id, started, finished, exit, success, stdout, stderr, trigger) = r?;
+            let (id, started, finished, exit, success, trigger) = r?;
             out.push(RunRecord {
                 id,
                 started_at: parse_dt(&started)?,
                 finished_at: parse_opt_dt(finished)?,
                 exit_code: exit.map(|v| v as i32),
                 success: success != 0,
-                stdout,
-                stderr,
+                stdout: String::new(),
+                stderr: String::new(),
                 trigger,
             });
         }
         Ok(out)
+    }
+
+    /// Fetch one run record with its captured output bodies.
+    pub fn get_run(&self, run_id: i64) -> Result<Option<RunRecord>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, started_at, finished_at, exit_code, success, stdout, stderr, trigger
+                 FROM runs WHERE id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        match row {
+            Some((id, started, finished, exit, success, stdout, stderr, trigger)) => {
+                Ok(Some(RunRecord {
+                    id,
+                    started_at: parse_dt(&started)?,
+                    finished_at: parse_opt_dt(finished)?,
+                    exit_code: exit.map(|v| v as i32),
+                    success: success != 0,
+                    stdout,
+                    stderr,
+                    trigger,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Close out runs left in the "started" state by a previous crash/quit and
+    /// reset rules stuck as `Running` (nothing can be running at startup).
+    pub fn reconcile_orphaned_runs(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let note = "\ncronch: interrupted by shutdown or restart";
+        let n = conn.execute(
+            "UPDATE runs SET finished_at = ?1, success = 0, stderr = stderr || ?2
+             WHERE finished_at IS NULL",
+            params![dt_to_str(&Utc::now()), note],
+        )?;
+        conn.execute(
+            "UPDATE rules SET last_status = 'Cancelled' WHERE last_status = 'Running'",
+            [],
+        )?;
+        Ok(n)
     }
 
     /// Delete history older than `days` days. If `days <= 0`, keep everything.
@@ -333,7 +412,7 @@ impl Store {
         let cutoff = Utc::now() - chrono::Duration::days(days);
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "DELETE FROM runs WHERE started_at < ?1",
+            "DELETE FROM runs WHERE started_at < ?1 AND finished_at IS NOT NULL",
             params![dt_to_str(&cutoff)],
         )?;
         Ok(n)
@@ -380,23 +459,140 @@ mod tests {
         assert_eq!(got.name, "my rule");
         assert_eq!(got.command, "echo hi");
         assert!(matches!(got.schedule, Schedule::Interval { seconds: 5 }));
+        assert_eq!(got.timeout_secs, 300, "timeout must round-trip");
         assert_eq!(store.list_rules().unwrap().len(), 1);
         store.delete_rule(rule.id).unwrap();
         assert_eq!(store.list_rules().unwrap().len(), 0);
     }
 
     #[test]
+    fn migrates_old_rules_table_adding_timeout_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a database created before the timeout column existed.
+        conn.execute_batch(
+            "CREATE TABLE rules (
+                id             TEXT PRIMARY KEY,
+                name           TEXT NOT NULL,
+                enabled        INTEGER NOT NULL,
+                command        TEXT NOT NULL,
+                shell          TEXT NOT NULL,
+                schedule       TEXT NOT NULL,
+                catch_up       INTEGER NOT NULL,
+                overlap        TEXT NOT NULL,
+                working_dir    TEXT,
+                env            TEXT NOT NULL,
+                created_at     TEXT NOT NULL,
+                last_run       TEXT,
+                next_run       TEXT,
+                last_exit_code INTEGER,
+                last_status    TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO rules (id,name,enabled,command,shell,schedule,catch_up,overlap,env,created_at,last_status)
+             VALUES ('x','r',1,'echo','{}','{}',1,'Skip','[]','2026-01-01T00:00:00Z','Never')",
+            [],
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let timeout: i64 = conn
+            .query_row("SELECT timeout_secs FROM rules WHERE id = 'x'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(timeout, 300, "migrated rows must get the default timeout");
+    }
+
+    #[test]
     fn run_history_roundtrip() {
         let store = Store::open_in_memory().unwrap();
-        let rule = Rule::new("r".into(), "echo".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         store.upsert_rule(&rule).unwrap();
         let started = Utc::now();
         let run_id = store.begin_run(rule.id, started, "manual").unwrap();
-        store.finish_run(run_id, Utc::now(), Some(0), true, "out", "").unwrap();
+        store
+            .finish_run(run_id, Utc::now(), Some(0), true, "out", "")
+            .unwrap();
         let runs = store.list_runs(rule.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].stdout, "out");
+        assert_eq!(runs[0].id, run_id);
         assert!(runs[0].success);
+        assert_eq!(runs[0].stdout, "", "list_runs must not carry output bodies");
+        let full = store.get_run(run_id).unwrap().unwrap();
+        assert_eq!(full.stdout, "out", "full record must carry captured output");
+    }
+
+    #[test]
+    fn reconcile_closes_orphaned_runs_and_status() {
+        let store = Store::open_in_memory().unwrap();
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        store.upsert_rule(&rule).unwrap();
+        store.mark_running(rule.id, Utc::now()).unwrap();
+        let run_id = store.begin_run(rule.id, Utc::now(), "schedule").unwrap();
+
+        let closed = store.reconcile_orphaned_runs().unwrap();
+        assert_eq!(closed, 1);
+
+        let run = store.get_run(run_id).unwrap().unwrap();
+        assert!(run.finished_at.is_some(), "orphan run must be closed");
+        assert!(!run.success);
+        assert!(run.stderr.contains("interrupted"));
+
+        let got = store.get_rule(rule.id).unwrap().unwrap();
+        assert_eq!(
+            got.last_status,
+            LastStatus::Cancelled,
+            "stale Running status must reset to Cancelled"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_running_runs() {
+        let store = Store::open_in_memory().unwrap();
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        store.upsert_rule(&rule).unwrap();
+
+        // A finished run and a still-open run, both started long ago.
+        let done = store.begin_run(rule.id, Utc::now(), "manual").unwrap();
+        store
+            .finish_run(done, Utc::now(), Some(0), true, "", "")
+            .unwrap();
+        let running = store.begin_run(rule.id, Utc::now(), "manual").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let old = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+            conn.execute("UPDATE runs SET started_at = ?1", params![old])
+                .unwrap();
+        }
+
+        let n = store.prune_history(5).unwrap();
+        assert_eq!(n, 1, "only the finished run may be pruned");
+        assert!(
+            store.get_run(done).unwrap().is_none(),
+            "finished run must be pruned"
+        );
+        assert!(
+            store.get_run(running).unwrap().is_some(),
+            "an in-flight run must never be pruned"
+        );
     }
 
     #[test]

@@ -1,17 +1,17 @@
 //! Glue between the Slint UI and the core (store + engine).
 
 use crate::autostart;
-use crate::model::{EnvVar, OverlapPolicy, Rule, Schedule, ShellKind};
+use crate::model::{EnvVar, LastStatus, OverlapPolicy, Rule, Schedule, ShellKind};
 use crate::scheduler::EngineHandle;
 use crate::shell::ShellCatalog;
 use crate::storage::Store;
 use crate::{MainWindow, RuleRow, RunRow};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 struct ShellOptions {
@@ -89,10 +89,19 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
             };
             RunRow {
                 id: r.id.to_string().into(),
-                started: r.started_at.with_timezone(&Local).format("%m-%d %H:%M:%S").to_string().into(),
+                started: r
+                    .started_at
+                    .with_timezone(&Local)
+                    .format("%m-%d %H:%M:%S")
+                    .to_string()
+                    .into(),
                 finished: fmt_dt(r.finished_at, "%H:%M:%S").into(),
                 status: status.into(),
-                exit_code: r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "—".into()).into(),
+                exit_code: r
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "—".into())
+                    .into(),
                 trigger: r.trigger.clone().into(),
                 stdout: r.stdout.clone().into(),
                 stderr: r.stderr.clone().into(),
@@ -100,6 +109,63 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
             }
         })
         .collect()
+}
+
+/// Content fingerprint of a run list, so the logs model is only rebuilt when
+/// its rows actually change. Hashing every row (not just the newest) means a
+/// `Parallel` run finishing out of order still triggers a redraw.
+fn run_signature(rows: &[RunRow]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    rows.len().hash(&mut h);
+    for r in rows {
+        r.id.as_str().hash(&mut h);
+        r.started.as_str().hash(&mut h);
+        r.finished.as_str().hash(&mut h);
+        r.status.as_str().hash(&mut h);
+        r.exit_code.as_str().hash(&mut h);
+        r.success.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Content fingerprint of the rule list (same rationale as [`run_signature`]).
+fn rule_signature(rows: &[RuleRow]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    rows.len().hash(&mut h);
+    for r in rows {
+        r.id.as_str().hash(&mut h);
+        r.name.as_str().hash(&mut h);
+        r.schedule.as_str().hash(&mut h);
+        r.shell.as_str().hash(&mut h);
+        r.status.as_str().hash(&mut h);
+        r.last_run.as_str().hash(&mut h);
+        r.next_run.as_str().hash(&mut h);
+        r.enabled.hash(&mut h);
+        r.shell_missing.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Load the captured output for the currently selected run into the model so
+/// the log view shows it without pulling every row's bodies on each refresh.
+fn fill_selected_run(store: &Store, ui: &MainWindow, model: &Rc<VecModel<RunRow>>) {
+    let idx = ui.get_selected_run_index() as usize;
+    let Some(mut row) = model.row_data(idx) else {
+        return;
+    };
+    let Ok(id) = row.id.parse::<i64>() else {
+        return;
+    };
+    let Ok(Some(full)) = store.get_run(id) else {
+        return;
+    };
+    row.stdout = full.stdout.into();
+    row.stderr = full.stderr.into();
+    model.set_row_data(idx, row);
 }
 
 fn parse_env(text: &str) -> Vec<EnvVar> {
@@ -110,8 +176,12 @@ fn parse_env(text: &str) -> Vec<EnvVar> {
                 return None;
             }
             let (k, v) = line.split_once('=')?;
+            let key = k.trim();
+            if key.is_empty() {
+                return None;
+            }
             Some(EnvVar {
-                key: k.trim().to_string(),
+                key: key.to_string(),
                 value: v.to_string(),
             })
         })
@@ -194,9 +264,22 @@ fn build_shell(ui: &MainWindow, opts: &ShellOptions) -> Result<ShellKind, String
     }
 }
 
-fn refresh_rules(ui: &MainWindow, store: &Store, catalog: &ShellCatalog, engine: &EngineHandle) {
+fn refresh_rules(
+    ui: &MainWindow,
+    store: &Store,
+    catalog: &ShellCatalog,
+    engine: &EngineHandle,
+    rules_model: &Rc<VecModel<RuleRow>>,
+    rules_signature: &Rc<RefCell<Option<u64>>>,
+) {
     let rows = build_rule_rows(store, catalog);
-    ui.set_rules(ModelRc::new(VecModel::from(rows)));
+    let signature = rule_signature(&rows);
+    // Only rebuild when the content changed, so a long list keeps its scroll
+    // position and hover state instead of being replaced every second.
+    if *rules_signature.borrow() != Some(signature) {
+        *rules_signature.borrow_mut() = Some(signature);
+        rules_model.set_vec(rows);
+    }
     ui.set_paused(engine.is_paused());
 }
 
@@ -213,8 +296,29 @@ pub fn setup(
     ui.set_direct_shell_index(opts.direct_index);
 
     let current_logs_rule: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
+    // Content fingerprints of the last rendered lists, so a view is only
+    // rebuilt when its rows actually change (avoids wiping scroll/selection and
+    // the selected run's output every second).
+    let rules_signature: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
+    let runs_signature: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
+    // When the header notice should disappear (set when the user clicks "Run now").
+    let notice_until: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
 
-    refresh_rules(ui, &store, &catalog, &engine);
+    // Persistent model instances: updates happen in place (set_vec), so the UI
+    // keeps scroll/selection state instead of being re-bound every second.
+    let rules_model = Rc::new(VecModel::<RuleRow>::default());
+    let runs_model = Rc::new(VecModel::<RunRow>::default());
+    ui.set_rules(ModelRc::new(rules_model.clone()));
+    ui.set_runs(ModelRc::new(runs_model.clone()));
+
+    refresh_rules(
+        ui,
+        &store,
+        &catalog,
+        &engine,
+        &rules_model,
+        &rules_signature,
+    );
 
     // --- Add ---
     {
@@ -238,6 +342,7 @@ pub fn setup(
             ui.set_edit_overlap(0);
             ui.set_edit_working_dir("".into());
             ui.set_edit_env("".into());
+            ui.set_edit_timeout(crate::model::default_timeout_secs() as i32);
             ui.set_edit_error("".into());
             ui.set_active_view(1);
         });
@@ -250,8 +355,12 @@ pub fn setup(
         let opts = opts.clone();
         ui.on_request_edit(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
-            let Ok(Some(rule)) = store.get_rule(uuid) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
+            let Ok(Some(rule)) = store.get_rule(uuid) else {
+                return;
+            };
 
             ui.set_edit_id(id);
             ui.set_edit_title("Edit rule".into());
@@ -291,7 +400,10 @@ pub fn setup(
                 Schedule::Once { at } => {
                     ui.set_edit_schedule_mode(2);
                     ui.set_edit_once(
-                        at.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string().into(),
+                        at.with_timezone(&Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                            .into(),
                     );
                 }
             }
@@ -303,6 +415,7 @@ pub fn setup(
             });
             ui.set_edit_working_dir(rule.working_dir.clone().unwrap_or_default().into());
             ui.set_edit_env(env_to_text(&rule.env).into());
+            ui.set_edit_timeout(rule.timeout_secs.clamp(0, 604_800) as i32);
             ui.set_edit_error("".into());
             ui.set_active_view(1);
         });
@@ -315,6 +428,8 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let opts = opts.clone();
+        let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_save_rule(move || {
             let Some(ui) = weak.upgrade() else { return };
             let shell = match build_shell(&ui, &opts) {
@@ -369,6 +484,7 @@ pub fn setup(
             let wd = ui.get_edit_working_dir().to_string();
             rule.working_dir = if wd.trim().is_empty() { None } else { Some(wd) };
             rule.env = parse_env(&ui.get_edit_env());
+            rule.timeout_secs = ui.get_edit_timeout() as i64;
 
             if let Err(e) = rule.validate() {
                 ui.set_edit_error(e.into());
@@ -381,7 +497,14 @@ pub fn setup(
             engine.reload_rule(rule.id);
             ui.set_edit_error("".into());
             ui.set_active_view(0);
-            refresh_rules(&ui, &store, &catalog, &engine);
+            refresh_rules(
+                &ui,
+                &store,
+                &catalog,
+                &engine,
+                &rules_model,
+                &rules_signature,
+            );
         });
     }
 
@@ -402,9 +525,13 @@ pub fn setup(
         let store = store.clone();
         let engine = engine.clone();
         let catalog = catalog.clone();
+        let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_request_delete(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
             let confirm = rfd::MessageDialog::new()
                 .set_title("Delete rule")
                 .set_description("Delete this rule and its run history? This cannot be undone.")
@@ -415,17 +542,44 @@ pub fn setup(
             }
             let _ = store.delete_rule(uuid);
             engine.remove_rule(uuid);
-            refresh_rules(&ui, &store, &catalog, &engine);
+            refresh_rules(
+                &ui,
+                &store,
+                &catalog,
+                &engine,
+                &rules_model,
+                &rules_signature,
+            );
         });
     }
 
     // --- Run now ---
     {
+        let weak = ui.as_weak();
+        let store = store.clone();
         let engine = engine.clone();
+        let notice_until = notice_until.clone();
         ui.on_request_run_now(move |id| {
-            if let Ok(uuid) = Uuid::parse_str(id.as_str()) {
-                engine.run_now(uuid);
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
+            // A manual run respects the rule's overlap policy; if it will be
+            // skipped because an instance is already running, say so instead of
+            // silently doing nothing.
+            let notice = match store.get_rule(uuid) {
+                Ok(Some(r)) if !r.enabled => "Rule is disabled",
+                Ok(Some(r))
+                    if r.last_status == LastStatus::Running && r.overlap == OverlapPolicy::Skip =>
+                {
+                    "Already running — this run was skipped"
+                }
+                _ => "Run requested",
+            };
+            engine.run_now(uuid);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_notice(notice.into());
             }
+            *notice_until.borrow_mut() = Some(Instant::now() + Duration::from_secs(4));
         });
     }
 
@@ -435,12 +589,23 @@ pub fn setup(
         let store = store.clone();
         let engine = engine.clone();
         let catalog = catalog.clone();
+        let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_request_toggle_enabled(move |id, enabled| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
             let _ = store.set_enabled(uuid, enabled);
             engine.reload_rule(uuid);
-            refresh_rules(&ui, &store, &catalog, &engine);
+            refresh_rules(
+                &ui,
+                &store,
+                &catalog,
+                &engine,
+                &rules_model,
+                &rules_signature,
+            );
         });
     }
 
@@ -449,9 +614,13 @@ pub fn setup(
         let weak = ui.as_weak();
         let store = store.clone();
         let current = current_logs_rule.clone();
+        let runs_signature = runs_signature.clone();
+        let runs_model = runs_model.clone();
         ui.on_request_open_logs(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
             *current.borrow_mut() = Some(uuid);
             let name = store
                 .get_rule(uuid)
@@ -461,8 +630,23 @@ pub fn setup(
                 .unwrap_or_default();
             ui.set_logs_rule_name(name.into());
             ui.set_selected_run_index(0);
-            ui.set_runs(ModelRc::new(VecModel::from(build_run_rows(&store, uuid))));
+            let rows = build_run_rows(&store, uuid);
+            *runs_signature.borrow_mut() = Some(run_signature(&rows));
+            runs_model.set_vec(rows);
+            fill_selected_run(&store, &ui, &runs_model);
             ui.set_active_view(2);
+        });
+    }
+
+    // --- Select a run in the logs view ---
+    {
+        let weak = ui.as_weak();
+        let store = store.clone();
+        let runs_model = runs_model.clone();
+        ui.on_request_select_run(move |idx| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_selected_run_index(idx);
+            fill_selected_run(&store, &ui, &runs_model);
         });
     }
 
@@ -492,16 +676,16 @@ pub fn setup(
         ui.on_save_settings(move || {
             let Some(ui) = weak.upgrade() else { return };
             let want = ui.get_setting_autostart();
+            // The OS login-item is the single source of truth; no DB mirror.
             let msg = if want {
                 match autostart::enable() {
-                    Ok(_) => "Saved. Launch at login is on.",
-                    Err(_) => "Saved, but enabling autostart failed.",
+                    Ok(_) => "Saved. Launch at login is on.".to_string(),
+                    Err(_) => "Saved, but enabling autostart failed.".to_string(),
                 }
             } else {
                 let _ = autostart::disable();
-                "Saved. Launch at login is off."
+                "Saved. Launch at login is off.".to_string()
             };
-            let _ = store.setting_set("autostart", if want { "1" } else { "0" });
             let days = ui.get_setting_retention_days();
             let _ = store.setting_set("history_retention_days", &days.to_string());
             let _ = store.prune_history(days as i64);
@@ -524,7 +708,9 @@ pub fn setup(
                     Ok(rules) => match serde_json::to_vec_pretty(&rules) {
                         Ok(bytes) => {
                             if std::fs::write(&path, bytes).is_ok() {
-                                ui.set_settings_status(format!("Exported {} rules.", rules.len()).into());
+                                ui.set_settings_status(
+                                    format!("Exported {} rules.", rules.len()).into(),
+                                );
                             } else {
                                 ui.set_settings_status("Export failed to write file.".into());
                             }
@@ -543,18 +729,46 @@ pub fn setup(
         let store = store.clone();
         let engine = engine.clone();
         let catalog = catalog.clone();
+        let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_import_rules(move || {
             let Some(ui) = weak.upgrade() else { return };
-            if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            {
                 match std::fs::read(&path) {
                     Ok(bytes) => match serde_json::from_slice::<Vec<Rule>>(&bytes) {
                         Ok(rules) => {
+                            let mut imported = 0usize;
+                            let mut skipped = 0usize;
                             for r in &rules {
-                                let _ = store.upsert_rule(r);
+                                if let Err(e) = r.validate() {
+                                    skipped += 1;
+                                    log::warn!("import skipped invalid rule '{}': {e}", r.name);
+                                    continue;
+                                }
+                                if store.upsert_rule(r).is_ok() {
+                                    imported += 1;
+                                } else {
+                                    skipped += 1;
+                                }
                             }
                             engine.reload_all();
-                            refresh_rules(&ui, &store, &catalog, &engine);
-                            ui.set_settings_status(format!("Imported {} rules.", rules.len()).into());
+                            refresh_rules(
+                                &ui,
+                                &store,
+                                &catalog,
+                                &engine,
+                                &rules_model,
+                                &rules_signature,
+                            );
+                            let msg = if skipped > 0 {
+                                format!("Imported {imported} rules ({skipped} invalid skipped).")
+                            } else {
+                                format!("Imported {imported} rules.")
+                            };
+                            ui.set_settings_status(msg.into());
                         }
                         Err(e) => ui.set_settings_status(format!("Import failed: {e}").into()),
                     },
@@ -606,21 +820,52 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let current = current_logs_rule.clone();
-        timer.start(TimerMode::Repeated, Duration::from_millis(1000), move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let view = ui.get_active_view();
-            if view == 0 {
-                refresh_rules(&ui, &store, &catalog, &engine);
-            } else {
-                // keep the paused indicator fresh everywhere
-                ui.set_paused(engine.is_paused());
-            }
-            if view == 2 {
-                if let Some(uuid) = *current.borrow() {
-                    ui.set_runs(ModelRc::new(VecModel::from(build_run_rows(&store, uuid))));
+        let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
+        let runs_model = runs_model.clone();
+        let runs_signature = runs_signature.clone();
+        let notice_until = notice_until.clone();
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(1000),
+            move || {
+                let Some(ui) = weak.upgrade() else { return };
+                // Retire the transient header notice once it has expired.
+                let notice_expired =
+                    matches!(*notice_until.borrow(), Some(until) if Instant::now() >= until);
+                if notice_expired {
+                    ui.set_notice("".into());
+                    *notice_until.borrow_mut() = None;
                 }
-            }
-        });
+                let view = ui.get_active_view();
+                if view == 0 {
+                    refresh_rules(
+                        &ui,
+                        &store,
+                        &catalog,
+                        &engine,
+                        &rules_model,
+                        &rules_signature,
+                    );
+                } else {
+                    // keep the paused indicator fresh everywhere
+                    ui.set_paused(engine.is_paused());
+                }
+                if view == 2
+                    && let Some(uuid) = *current.borrow()
+                {
+                    let rows = build_run_rows(&store, uuid);
+                    let signature = run_signature(&rows);
+                    // Only rebuild when the list actually changed, so the selected
+                    // run's captured output is not wiped every second.
+                    if *runs_signature.borrow() != Some(signature) {
+                        *runs_signature.borrow_mut() = Some(signature);
+                        runs_model.set_vec(rows);
+                    }
+                    fill_selected_run(&store, &ui, &runs_model);
+                }
+            },
+        );
     }
     timer
 }

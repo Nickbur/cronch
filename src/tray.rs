@@ -1,6 +1,7 @@
 //! System-tray icon and context menu.
 
 use anyhow::Result;
+use std::cell::Cell;
 use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
@@ -11,6 +12,8 @@ pub struct Tray {
     pub id_open: MenuId,
     pub id_toggle: MenuId,
     pub id_quit: MenuId,
+    /// Last applied paused state, so the icon/menu only change when it flips.
+    paused: Cell<bool>,
 }
 
 impl Tray {
@@ -41,12 +44,18 @@ impl Tray {
             id_toggle: toggle.id().clone(),
             id_quit: quit.id().clone(),
             item_toggle: toggle,
+            paused: Cell::new(false),
             tray,
         })
     }
 
-    /// Reflect paused state on the tray icon + menu label.
+    /// Reflect paused state on the tray icon + menu label. No-op unless the
+    /// state actually changed (the icon is expensive to rebuild).
     pub fn set_paused(&self, paused: bool) {
+        if self.paused.get() == paused {
+            return;
+        }
+        self.paused.set(paused);
         self.item_toggle
             .set_text(if paused { "Resume all" } else { "Pause all" });
         let _ = self.tray.set_icon(Some(crate::icon::make_icon(!paused)));

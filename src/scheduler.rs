@@ -17,10 +17,10 @@ use crate::shell::ShellCatalog;
 use crate::storage::Store;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration as StdDuration, Instant};
+use tokio::sync::{mpsc, watch};
 use uuid::Uuid;
 
 pub enum Ctrl {
@@ -34,7 +34,6 @@ pub enum Ctrl {
     RunNow(Uuid),
     PauseAll,
     ResumeAll,
-    Shutdown,
 }
 
 struct JobDone {
@@ -48,6 +47,10 @@ struct JobDone {
 pub struct EngineHandle {
     tx: mpsc::Sender<Ctrl>,
     pub paused: Arc<AtomicBool>,
+    /// Engine-stop signal, broadcast directly (not through the control channel)
+    /// so a full channel can never prevent shutdown. In-flight jobs subscribe to
+    /// the same sender and cancel their process groups when it flips.
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl EngineHandle {
@@ -78,7 +81,7 @@ impl EngineHandle {
         self.send(Ctrl::ResumeAll);
     }
     pub fn shutdown(&self) {
-        self.send(Ctrl::Shutdown);
+        self.shutdown_tx.send_replace(true);
     }
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
@@ -91,26 +94,37 @@ struct Engine {
     base_env: Arc<BaseEnv>,
     armed: HashMap<Uuid, DateTime<Utc>>,
     rules: HashMap<Uuid, Rule>,
-    running: HashSet<Uuid>,
+    /// Number of in-flight runs per rule (Parallel can run several at once).
+    running: HashMap<Uuid, usize>,
     pending: HashSet<Uuid>,
     paused: Arc<AtomicBool>,
     jobdone_tx: mpsc::Sender<JobDone>,
+    /// Broadcast to in-flight jobs: flipping this to `true` asks each job to
+    /// kill its process group and report back, so quitting leaves nothing behind.
+    shutdown_tx: watch::Sender<bool>,
+    /// Last time history retention was applied (the engine prunes at most once
+    /// a day, so a long-running app does not grow history unbounded).
+    last_prune: Instant,
 }
 
 impl Engine {
-    fn mark_expired(&self, id: Uuid) {
-        let _ = self.store.set_status(id, LastStatus::Expired);
-    }
-
     /// Compute and store the next fire time for a rule (with optional catch-up).
-    fn arm_rule(&mut self, rule: Rule, catch_up: bool) {
+    fn arm_rule(&mut self, mut rule: Rule, catch_up: bool) {
         let id = rule.id;
+        // Honor the per-rule "Catch up if missed" toggle: engine catch-up (used
+        // on startup and on resume) applies only when the rule itself opts in.
+        // Never catch up a rule that already has a run in flight: the missed
+        // occurrences are moot, and an immediate fire would only collide with
+        // (and momentarily mislabel) the run that is already going.
+        let busy = self.running.get(&id).copied().unwrap_or(0) > 0;
+        let catch_up = catch_up && rule.catch_up && !busy;
         if !rule.enabled {
             self.armed.remove(&id);
             self.rules.insert(id, rule);
             return;
         }
         let now = Utc::now();
+        let mut expired = false;
         let next: Option<DateTime<Utc>> = match &rule.schedule {
             Schedule::Interval { seconds } => {
                 let anchor = rule.last_run.unwrap_or(now);
@@ -126,7 +140,10 @@ impl Engine {
             }
             Schedule::Cron { .. } => {
                 if catch_up {
-                    match rule.last_run.and_then(|last| rule.schedule.next_after(last)) {
+                    match rule
+                        .last_run
+                        .and_then(|last| rule.schedule.next_after(last))
+                    {
                         Some(missed) if missed <= now => Some(now),
                         _ => rule.schedule.next_after(now),
                     }
@@ -141,7 +158,7 @@ impl Engine {
                     if catch_up {
                         Some(now)
                     } else {
-                        self.mark_expired(id);
+                        expired = true;
                         None
                     }
                 } else {
@@ -149,6 +166,10 @@ impl Engine {
                 }
             }
         };
+        if expired {
+            let _ = self.store.set_status(id, LastStatus::Expired);
+            rule.last_status = LastStatus::Expired;
+        }
         match next {
             Some(t) => {
                 self.armed.insert(id, t);
@@ -176,6 +197,16 @@ impl Engine {
         }
         let next = match &schedule {
             Schedule::Once { .. } => None,
+            Schedule::Interval { seconds } => {
+                // Anchor on the scheduled time that just fired so the cadence
+                // keeps its phase instead of drifting by wake-up jitter.
+                let anchor = self.armed.get(&id).copied().unwrap_or(now);
+                let mut t = anchor + ChronoDuration::seconds(*seconds);
+                if t <= now {
+                    t = now + ChronoDuration::seconds(*seconds);
+                }
+                Some(t)
+            }
             s => s.next_after(now),
         };
         match next {
@@ -198,11 +229,14 @@ impl Engine {
         if !rule.enabled {
             return;
         }
-        if self.running.contains(&id) {
+        if self.running.get(&id).copied().unwrap_or(0) > 0 {
             match rule.overlap {
                 OverlapPolicy::Skip => {
                     log::info!("skip overlapping run for '{}'", rule.name);
                     let _ = self.store.set_status(id, LastStatus::Skipped);
+                    if let Some(r) = self.rules.get_mut(&id) {
+                        r.last_status = LastStatus::Skipped;
+                    }
                     return;
                 }
                 OverlapPolicy::Queue => {
@@ -218,12 +252,13 @@ impl Engine {
     fn spawn_job(&mut self, rule: Rule, trigger: &'static str) {
         let id = rule.id;
         let now = Utc::now();
-        self.running.insert(id);
+        let running_count = self.running.get(&id).copied().unwrap_or(0);
+        self.running.insert(id, running_count + 1);
         let run_id = match self.store.begin_run(id, now, trigger) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("begin_run failed: {e}");
-                self.running.remove(&id);
+                self.decrement_running(&id);
                 return;
             }
         };
@@ -235,9 +270,10 @@ impl Engine {
         let tx = self.jobdone_tx.clone();
         let catalog = self.catalog.clone();
         let base_env = self.base_env.clone();
+        let shutdown = self.shutdown_tx.subscribe();
         log::info!("running '{}' ({trigger})", rule.name);
         tokio::spawn(async move {
-            let outcome = executor::execute(&rule, &catalog, &base_env).await;
+            let outcome = executor::execute(&rule, &catalog, &base_env, shutdown).await;
             let _ = tx
                 .send(JobDone {
                     rule_id: id,
@@ -249,6 +285,22 @@ impl Engine {
         });
     }
 
+    /// Decrement the in-flight counter for a rule; returns whether other
+    /// instances of the same rule are still running.
+    fn decrement_running(&mut self, id: &Uuid) -> bool {
+        match self.running.get_mut(id) {
+            Some(c) => {
+                *c -= 1;
+                let still = *c > 0;
+                if !still {
+                    self.running.remove(id);
+                }
+                still
+            }
+            None => false,
+        }
+    }
+
     fn handle_done(&mut self, done: JobDone) {
         let JobDone {
             rule_id,
@@ -256,8 +308,11 @@ impl Engine {
             outcome,
             finished,
         } = done;
-        self.running.remove(&rule_id);
-        let status = if outcome.success {
+        let status = if outcome.cancelled {
+            LastStatus::Cancelled
+        } else if outcome.timed_out {
+            LastStatus::TimedOut
+        } else if outcome.success {
             LastStatus::Success
         } else {
             LastStatus::Failed
@@ -270,22 +325,37 @@ impl Engine {
             &outcome.stdout,
             &outcome.stderr,
         );
-        let _ = self.store.set_result(rule_id, outcome.exit_code, status);
-        if let Some(r) = self.rules.get_mut(&rule_id) {
-            r.last_exit_code = outcome.exit_code;
-            r.last_status = status;
-        }
-        log::info!(
-            "finished '{}' -> {} (exit {:?})",
-            self.rules.get(&rule_id).map(|r| r.name.as_str()).unwrap_or("?"),
-            status.as_str(),
-            outcome.exit_code
-        );
-        // A queued run was requested while this one was in flight.
-        if self.pending.remove(&rule_id) {
-            if let Some(rule) = self.rules.get(&rule_id).cloned() {
+        let still_running = self.decrement_running(&rule_id);
+        if !still_running {
+            let _ = self.store.set_result(rule_id, outcome.exit_code, status);
+            if let Some(r) = self.rules.get_mut(&rule_id) {
+                r.last_exit_code = outcome.exit_code;
+                r.last_status = status;
+            }
+            log::info!(
+                "finished '{}' -> {} (exit {:?})",
+                self.rules
+                    .get(&rule_id)
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("?"),
+                status.as_str(),
+                outcome.exit_code
+            );
+            // A queued run was requested while a run was in flight.
+            if self.pending.remove(&rule_id)
+                && let Some(rule) = self.rules.get(&rule_id).cloned()
+            {
                 self.spawn_job(rule, "queued");
             }
+        } else {
+            log::info!(
+                "parallel run of '{}' finished; {} still running",
+                self.rules
+                    .get(&rule_id)
+                    .map(|r| r.name.as_str())
+                    .unwrap_or("?"),
+                self.running.get(&rule_id).copied().unwrap_or(0)
+            );
         }
     }
 
@@ -315,8 +385,10 @@ impl Engine {
         }
     }
 
-    /// Returns true if the engine should shut down.
-    fn handle_ctrl(&mut self, c: Ctrl) -> bool {
+    /// Apply a control message. Engine shutdown is not a control message — it
+    /// is delivered via `shutdown_tx` (see `run`), so a full control channel
+    /// can never block quitting.
+    fn handle_ctrl(&mut self, c: Ctrl) {
         match c {
             Ctrl::StartupLoad => self.load_all(true),
             Ctrl::ReloadAll => self.load_all(false),
@@ -325,11 +397,14 @@ impl Engine {
                 self.rules.remove(&id);
                 self.armed.remove(&id);
                 self.pending.remove(&id);
+                self.running.remove(&id);
             }
             Ctrl::RunNow(id) => {
                 if let Ok(Some(rule)) = self.store.get_rule(id) {
-                    self.rules.insert(id, rule.clone());
-                    self.spawn_job(rule, "manual");
+                    self.rules.insert(id, rule);
+                    // Route through fire() so manual runs respect the rule's
+                    // enabled flag and overlap policy (Skip/Queue/Parallel).
+                    self.fire(id, "manual");
                 }
             }
             Ctrl::PauseAll => {
@@ -338,12 +413,12 @@ impl Engine {
             }
             Ctrl::ResumeAll => {
                 self.paused.store(false, Ordering::Relaxed);
-                self.load_all(false);
+                // Resume mirrors startup: rules that opted into "catch up if
+                // missed" fire once for the backlog they accrued while paused.
+                self.load_all(true);
                 log::info!("resumed all rules");
             }
-            Ctrl::Shutdown => return true,
         }
-        false
     }
 
     fn next_sleep(&self) -> StdDuration {
@@ -369,9 +444,26 @@ impl Engine {
             .flatten()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(30);
-        if let Ok(n) = self.store.prune_history(days) {
-            if n > 0 {
-                log::info!("pruned {n} old run records");
+        if let Ok(n) = self.store.prune_history(days)
+            && n > 0
+        {
+            log::info!("pruned {n} old run records");
+        }
+    }
+
+    /// After the shutdown broadcast, wait (bounded) for in-flight jobs to
+    /// report back so their run rows are closed instead of left dangling.
+    async fn drain(&mut self, jobdone_rx: &mut mpsc::Receiver<JobDone>) {
+        self.pending.clear();
+        let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
+        while !self.running.is_empty() {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline - now, jobdone_rx.recv()).await {
+                Ok(Some(done)) => self.handle_done(done),
+                _ => break,
             }
         }
     }
@@ -380,10 +472,15 @@ impl Engine {
         mut self,
         mut ctrl_rx: mpsc::Receiver<Ctrl>,
         mut jobdone_rx: mpsc::Receiver<JobDone>,
+        mut shutdown_rx: watch::Receiver<bool>,
     ) {
         self.prune_history_setting();
         log::info!("scheduler engine started");
         loop {
+            if self.last_prune.elapsed() >= StdDuration::from_secs(24 * 60 * 60) {
+                self.prune_history_setting();
+                self.last_prune = Instant::now();
+            }
             if !self.paused.load(Ordering::Relaxed) {
                 let now = Utc::now();
                 let due: Vec<Uuid> = self
@@ -401,11 +498,18 @@ impl Engine {
             tokio::select! {
                 maybe = ctrl_rx.recv() => {
                     match maybe {
-                        Some(c) => if self.handle_ctrl(c) { break; },
+                        Some(c) => self.handle_ctrl(c),
                         None => break,
                     }
                 }
                 Some(done) = jobdone_rx.recv() => self.handle_done(done),
+                _ = shutdown_rx.changed() => {
+                    // Stop requested: the same broadcast already told in-flight
+                    // jobs to kill their process groups. Wait for them to report
+                    // so their run rows are closed, then exit.
+                    self.drain(&mut jobdone_rx).await;
+                    break;
+                }
                 _ = tokio::time::sleep(sleep_dur) => {}
             }
         }
@@ -422,6 +526,7 @@ pub fn create(
 ) -> (EngineHandle, impl std::future::Future<Output = ()>) {
     let (ctrl_tx, ctrl_rx) = mpsc::channel(128);
     let (jobdone_tx, jobdone_rx) = mpsc::channel(128);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let paused = Arc::new(AtomicBool::new(false));
     let engine = Engine {
         store,
@@ -429,13 +534,19 @@ pub fn create(
         base_env,
         armed: HashMap::new(),
         rules: HashMap::new(),
-        running: HashSet::new(),
+        running: HashMap::new(),
         pending: HashSet::new(),
         paused: paused.clone(),
         jobdone_tx,
+        shutdown_tx: shutdown_tx.clone(),
+        last_prune: Instant::now(),
     };
-    let handle = EngineHandle { tx: ctrl_tx, paused };
-    (handle, engine.run(ctrl_rx, jobdone_rx))
+    let handle = EngineHandle {
+        tx: ctrl_tx,
+        paused,
+        shutdown_tx,
+    };
+    (handle, engine.run(ctrl_rx, jobdone_rx, shutdown_rx))
 }
 
 #[cfg(test)]
@@ -446,7 +557,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fires_interval_rule_end_to_end() {
         let store = Store::open_in_memory().unwrap();
-        let cmd = if cfg!(windows) { "cmd /C echo hi" } else { "echo hi" };
+        let cmd = if cfg!(windows) {
+            "cmd /C echo hi"
+        } else {
+            "echo hi"
+        };
         let rule = Rule::new(
             "t".into(),
             cmd.into(),
@@ -471,6 +586,136 @@ mod tests {
         assert!(
             runs.iter().any(|r| r.success),
             "expected at least one successful run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn shutdown_cancels_running_job_and_closes_row() {
+        let store = Store::open_in_memory().unwrap();
+        #[cfg(windows)]
+        let cmd = "cmd /C \"ping -n 60 127.0.0.1 >NUL\"";
+        #[cfg(not(windows))]
+        let cmd = "sh -c 'sleep 60'";
+        let mut rule = Rule::new(
+            "t".into(),
+            cmd.into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 60 },
+        );
+        rule.timeout_secs = 0; // only shutdown can end this run
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, fut) = create(
+            store.clone(),
+            Arc::new(ShellCatalog::detect()),
+            Arc::new(BaseEnv::resolve()),
+        );
+        let jh = tokio::spawn(fut);
+        handle.run_now(rule.id);
+
+        // Wait until the run has actually started (a row exists).
+        let mut waited = StdDuration::ZERO;
+        while store.list_runs(rule.id, 10).unwrap().is_empty() {
+            assert!(waited < StdDuration::from_secs(5), "run never started");
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            waited += StdDuration::from_millis(50);
+        }
+
+        handle.shutdown();
+        tokio::time::timeout(StdDuration::from_secs(10), jh)
+            .await
+            .expect("engine must stop after shutdown")
+            .unwrap();
+
+        let runs = store.list_runs(rule.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(
+            runs[0].finished_at.is_some(),
+            "run row must be closed on shutdown"
+        );
+        assert!(!runs[0].success, "cancelled run must not be a success");
+        let got = store.get_rule(rule.id).unwrap().unwrap();
+        assert_eq!(
+            got.last_status,
+            LastStatus::Cancelled,
+            "a cancelled run must mark the rule Cancelled, not Failed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_does_not_catch_up_a_busy_rule() {
+        let store = Store::open_in_memory().unwrap();
+        #[cfg(windows)]
+        let cmd = "cmd /C \"ping -n 60 127.0.0.1 >NUL\"";
+        #[cfg(not(windows))]
+        let cmd = "sh -c 'sleep 60'";
+        let mut rule = Rule::new(
+            "t".into(),
+            cmd.into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 1 },
+        );
+        rule.timeout_secs = 0;
+        rule.overlap = OverlapPolicy::Parallel;
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, fut) = create(
+            store.clone(),
+            Arc::new(ShellCatalog::detect()),
+            Arc::new(BaseEnv::resolve()),
+        );
+        let jh = tokio::spawn(fut);
+        // Manual run only: the rule is not armed, so nothing fires on a timer.
+        handle.run_now(rule.id);
+        let mut waited = StdDuration::ZERO;
+        while store.list_runs(rule.id, 10).unwrap().is_empty() {
+            assert!(waited < StdDuration::from_secs(5), "run never started");
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            waited += StdDuration::from_millis(50);
+        }
+        // Let the 1s interval elapse so a catch-up would be due.
+        tokio::time::sleep(StdDuration::from_millis(1500)).await;
+
+        // Resume triggers a catch-up reload; because a run is in flight it must
+        // be suppressed, so no second (Parallel) run starts.
+        handle.resume_all();
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        assert_eq!(
+            store.list_runs(rule.id, 10).unwrap().len(),
+            1,
+            "a busy rule must not catch up on resume"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(StdDuration::from_secs(10), jh).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_now_respects_disabled_rule() {
+        let store = Store::open_in_memory().unwrap();
+        let mut rule = Rule::new(
+            "t".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 60 },
+        );
+        rule.enabled = false;
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, fut) = create(
+            store.clone(),
+            Arc::new(ShellCatalog::detect()),
+            Arc::new(BaseEnv::resolve()),
+        );
+        let jh = tokio::spawn(fut);
+        handle.run_now(rule.id);
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        handle.shutdown();
+        let _ = jh.await;
+
+        assert!(
+            store.list_runs(rule.id, 10).unwrap().is_empty(),
+            "manual run must not start a disabled rule"
         );
     }
 }

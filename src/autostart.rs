@@ -16,7 +16,7 @@ fn builder() -> Result<AutoLaunch> {
     b.set_args(&[MINIMIZED_ARG]);
     #[cfg(target_os = "macos")]
     {
-        b.set_use_launch_agent(true);
+        b.set_macos_launch_mode(auto_launch::MacOSLaunchMode::LaunchAgent);
     }
     b.build().context("build auto-launch config")
 }

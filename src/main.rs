@@ -18,8 +18,8 @@ use anyhow::Result;
 use slint::{ComponentHandle, TimerMode};
 use std::sync::Arc;
 use std::time::Duration;
-use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
+use tray_icon::menu::MenuEvent;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -34,6 +34,13 @@ fn main() -> Result<()> {
     let dirs = config::project_dirs()?;
     let db = config::db_path(&dirs)?;
     let store = storage::Store::open(&db)?;
+    // A previous quit/crash may have left runs open and rules stuck as
+    // "Running"; nothing is running at startup, so close those out.
+    if let Ok(n) = store.reconcile_orphaned_runs()
+        && n > 0
+    {
+        log::info!("reconciled {n} orphaned run records");
+    }
     let catalog = Arc::new(shell::ShellCatalog::detect());
     let base_env = Arc::new(envres::BaseEnv::resolve());
     log::info!(
@@ -42,18 +49,20 @@ fn main() -> Result<()> {
     );
 
     // First run: enable login autostart by default (disclosed in the UI banner).
+    // Mark the setup as done immediately so a later launch never re-enables
+    // autostart against the user's wishes (e.g. after they turned it off).
     let first_run = store.setting_get("first_run_seen")?.is_none();
     if first_run {
         if let Err(e) = autostart::enable() {
             log::warn!("could not enable autostart on first run: {e}");
         }
-        let _ = store.setting_set("autostart", "1");
+        let _ = store.setting_set("first_run_seen", "1");
         let _ = store.setting_set("history_retention_days", "30");
     }
 
     // Scheduler engine on its own thread with a tokio runtime.
     let (handle_tx, handle_rx) = std::sync::mpsc::channel();
-    {
+    let engine_thread = {
         let store = store.clone();
         let catalog = catalog.clone();
         let base_env = base_env.clone();
@@ -69,8 +78,8 @@ fn main() -> Result<()> {
                     let _ = handle_tx.send(handle);
                     fut.await;
                 });
-            })?;
-    }
+            })?
+    };
     let engine = handle_rx.recv().expect("receive engine handle");
     engine.startup_load();
 
@@ -114,11 +123,13 @@ fn main() -> Result<()> {
                 }
             }
             while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-                if let TrayIconEvent::Click { .. } = ev {
-                    if let Some(ui) = weak.upgrade() {
-                        let _ = ui.show();
-                        ui.set_active_view(0);
-                    }
+                // Only react to left-clicks; right-click opens the context menu.
+                if let TrayIconEvent::Click { button, .. } = ev
+                    && button == tray_icon::MouseButton::Left
+                    && let Some(ui) = weak.upgrade()
+                {
+                    let _ = ui.show();
+                    ui.set_active_view(0);
                 }
             }
             tray.set_paused(engine.is_paused());
@@ -127,11 +138,15 @@ fn main() -> Result<()> {
 
     // Start hidden when launched at login (unless it's the very first run).
     let minimized = std::env::args().any(|a| a == autostart::MINIMIZED_ARG);
-    if !(minimized && !first_run) {
+    if !minimized || first_run {
         ui.show()?;
     }
 
     slint::run_event_loop()?;
+    // Stop the engine and wait for it: it broadcasts a shutdown to in-flight
+    // jobs (killing their process groups) and closes their run rows before the
+    // process exits, so quitting leaves nothing running behind.
     engine.shutdown();
+    let _ = engine_thread.join();
     Ok(())
 }

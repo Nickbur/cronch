@@ -1,2 +1,11 @@
 /target
 .DS_Store
+
+# npm (package.json is a command list only — never commit its lockfile or deps)
+node_modules/
+package-lock.json
+
+# Editor: only the shared settings are versioned
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json

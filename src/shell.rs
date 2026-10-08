@@ -34,12 +34,28 @@ impl ShellCatalog {
     }
 }
 
+/// True if `path` is a regular file we may execute. On Unix this checks the
+/// executable bit; on Windows the extension (PATHEXT) is what matters, and the
+/// callers pass explicit `.exe` names.
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.metadata()
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
 /// Search PATH for an executable, returning its absolute path.
 fn which(program: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(program);
-        if candidate.is_file() {
+        if is_executable(&candidate) {
             return Some(candidate);
         }
     }

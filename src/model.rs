@@ -38,10 +38,17 @@ impl Schedule {
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             Schedule::Interval { seconds } => Some(after + Duration::seconds(*seconds)),
-            Schedule::Cron { expr } => cron::Schedule::from_str(&normalize_cron(expr))
-                .ok()?
-                .after(&after)
-                .next(),
+            Schedule::Cron { expr } => {
+                // The cron crate matches fields against the datetime's own
+                // timezone, so evaluate in local time (users enter cron
+                // expressions in wall-clock terms, not UTC).
+                let local = after.with_timezone(&Local);
+                cron::Schedule::from_str(&normalize_cron(expr))
+                    .ok()?
+                    .after(&local)
+                    .next()
+                    .map(|t| t.with_timezone(&Utc))
+            }
             Schedule::Once { at } => {
                 if *at > after {
                     Some(*at)
@@ -115,6 +122,17 @@ impl ShellKind {
     }
 }
 
+/// Placeholder in a shell argument template replaced by the rule's command
+/// (as a single argument) at execution time.
+pub const CMD_PLACEHOLDER: &str = "{cmd}";
+
+/// Split an argument template into words exactly the way the executor will, so
+/// validation and execution can never disagree. Shell-like quoting/escaping is
+/// honored; the `{cmd}` placeholder is left in place for the caller to expand.
+pub fn parse_arg_template(template: &str) -> Result<Vec<String>, String> {
+    shell_words::split(template).map_err(|e| format!("Invalid argument template: {e}"))
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OverlapPolicy {
     Skip,
@@ -148,6 +166,10 @@ pub enum LastStatus {
     Failed,
     Skipped,
     Expired,
+    TimedOut,
+    /// The run did not complete because the app shut down (graceful quit or a
+    /// crash that left the run open).
+    Cancelled,
 }
 
 impl LastStatus {
@@ -159,6 +181,8 @@ impl LastStatus {
             LastStatus::Failed => "Failed",
             LastStatus::Skipped => "Skipped",
             LastStatus::Expired => "Expired",
+            LastStatus::TimedOut => "TimedOut",
+            LastStatus::Cancelled => "Cancelled",
         }
     }
     pub fn from_str_lossy(s: &str) -> Self {
@@ -168,6 +192,8 @@ impl LastStatus {
             "Failed" => LastStatus::Failed,
             "Skipped" => LastStatus::Skipped,
             "Expired" => LastStatus::Expired,
+            "TimedOut" => LastStatus::TimedOut,
+            "Cancelled" => LastStatus::Cancelled,
             _ => LastStatus::Never,
         }
     }
@@ -177,6 +203,12 @@ impl LastStatus {
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+}
+
+/// Default per-rule timeout in seconds: 5 minutes. Applied to new rules and to
+/// imported rules that predate the field.
+pub fn default_timeout_secs() -> i64 {
+    300
 }
 
 /// A scheduled task.
@@ -194,6 +226,9 @@ pub struct Rule {
     pub working_dir: Option<String>,
     pub env: Vec<EnvVar>,
     pub created_at: DateTime<Utc>,
+    /// Kill the job after this many seconds; 0 = no limit.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: i64,
 
     // Runtime state (persisted).
     #[serde(default)]
@@ -220,6 +255,7 @@ impl Rule {
             working_dir: None,
             env: Vec::new(),
             created_at: Utc::now(),
+            timeout_secs: default_timeout_secs(),
             last_run: None,
             next_run: None,
             last_exit_code: None,
@@ -234,11 +270,15 @@ impl Rule {
         if self.command.trim().is_empty() {
             return Err("Command must not be empty".into());
         }
+        if self.timeout_secs < 0 {
+            return Err("Timeout must be 0 (no limit) or a positive number of seconds".into());
+        }
         if let ShellKind::Custom { path, arg_template } = &self.shell {
             if path.trim().is_empty() {
                 return Err("Custom shell path must not be empty".into());
             }
-            if !arg_template.contains("{cmd}") {
+            let words = parse_arg_template(arg_template)?;
+            if !words.iter().any(|w| w.contains(CMD_PLACEHOLDER)) {
                 return Err("Custom argument template must contain {cmd}".into());
             }
         }
@@ -262,7 +302,7 @@ pub struct RunRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
 
     #[test]
     fn normalize_cron_adds_seconds_field() {
@@ -280,23 +320,92 @@ mod tests {
     #[test]
     fn once_in_past_is_none() {
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let s = Schedule::Once { at: base - Duration::seconds(10) };
+        let s = Schedule::Once {
+            at: base - Duration::seconds(10),
+        };
         assert_eq!(s.next_after(base), None);
-        let s2 = Schedule::Once { at: base + Duration::seconds(10) };
+        let s2 = Schedule::Once {
+            at: base + Duration::seconds(10),
+        };
         assert_eq!(s2.next_after(base), Some(base + Duration::seconds(10)));
     }
 
     #[test]
     fn cron_validation() {
-        assert!(Schedule::Cron { expr: "0 9 * * *".into() }.validate().is_ok());
-        assert!(Schedule::Cron { expr: "nonsense".into() }.validate().is_err());
+        assert!(
+            Schedule::Cron {
+                expr: "0 9 * * *".into()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Schedule::Cron {
+                expr: "nonsense".into()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cron_next_after_is_evaluated_in_local_time() {
+        let s = Schedule::Cron {
+            expr: "0 9 * * *".into(),
+        };
+        let next = s.next_after(Utc::now()).expect("cron should fire");
+        assert_eq!(
+            next.with_timezone(&Local).hour(),
+            9,
+            "cron must be interpreted in local time, not UTC"
+        );
     }
 
     #[test]
     fn rule_validation() {
-        let mut r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let mut r = Rule::new(
+            "n".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         assert!(r.validate().is_ok());
         r.command = "  ".into();
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn rule_default_timeout_is_300_seconds() {
+        let r = Rule::new(
+            "n".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        assert_eq!(r.timeout_secs, 300, "new rules must have a default timeout");
+    }
+
+    #[test]
+    fn rule_rejects_negative_timeout() {
+        let mut r = Rule::new(
+            "n".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        r.timeout_secs = -1;
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn last_status_timed_out_roundtrips() {
+        assert_eq!(LastStatus::TimedOut.as_str(), "TimedOut");
+        assert_eq!(LastStatus::from_str_lossy("TimedOut"), LastStatus::TimedOut);
+        assert_eq!(LastStatus::Cancelled.as_str(), "Cancelled");
+        assert_eq!(
+            LastStatus::from_str_lossy("Cancelled"),
+            LastStatus::Cancelled
+        );
+        assert_eq!(LastStatus::from_str_lossy("unknown"), LastStatus::Never);
     }
 }

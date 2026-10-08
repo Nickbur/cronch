@@ -1,0 +1,1 @@
+sh .husky/conventional-commit.sh "$1"

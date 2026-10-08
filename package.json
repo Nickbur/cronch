@@ -1,0 +1,20 @@
+{
+    "name": "cronch",
+    "private": true,
+    "version": "1.0.0",
+    "type": "module",
+    "description": "Command list for the Cronch Rust project — a convenience wrapper around cargo.",
+    "scripts": {
+        "serve": "cargo run",
+        "fix": "cargo fmt --all && cargo clippy --fix --allow-dirty --allow-staged --all-targets",
+        "build": "cargo clippy --all-targets -- -D warnings && cargo test --release && cargo build --release",
+        "re-install-npm": "cargo clean && cargo build",
+        "prepare": "husky || exit 0"
+    },
+    "devDependencies": {
+        "husky": "9.1.7"
+    },
+    "engines": {
+        "node": ">=24.16.0"
+    }
+}

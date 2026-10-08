@@ -1,14 +1,22 @@
 [package]
 name = "cronch"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "A cross-platform (Windows & macOS) system-tray task scheduler."
 authors = ["burakov"]
 homepage = "https://burakov.net"
+repository = "https://github.com/Nickbur/cronch"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["scheduler", "cron", "tray", "automation", "tasks"]
-categories = ["command-line-utilities"]
+categories = ["gui"]
+
+# macOS .app packaging via `cargo bundle` (see BUILD.md). Points at the bundled
+# brand icon so the asset is actually used rather than sitting dead in the repo.
+[package.metadata.bundle]
+name = "Cronch"
+identifier = "net.burakov.Cronch"
+icon = ["assets/icon.icns"]
 
 [profile.release]
 opt-level = "z"
@@ -32,9 +40,7 @@ serde_json = "1.0.151"
 shell-words = "1.1.1"
 single-instance = "0.3.3"
 slint = "1.17.1"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
-toml = "1.1.5"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "io-util"] }
 tray-icon = "0.24.2"
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
 
@@ -44,3 +50,7 @@ slint-build = "1.17.1"
 # Windows-only: embeds assets/icon.ico into the .exe (Explorer/taskbar icon).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Unix-only: kill a job's whole process group on timeout.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
