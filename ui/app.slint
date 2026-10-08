@@ -63,6 +63,7 @@ export component MainWindow inherits Window {
     in-out property <string> edit-once;
     in-out property <bool> edit-catch-up: true;
     in-out property <int> edit-overlap: 0; // 0 skip 1 queue 2 parallel
+    in-out property <int> edit-timeout: 300; // seconds, 0 = no limit
     in-out property <string> edit-working-dir;
     in-out property <string> edit-env;
     in-out property <string> edit-error;
@@ -189,6 +190,7 @@ export component MainWindow inherits Window {
                                     color: row.status == "Success" ? #43c06a
                                         : row.status == "Failed" ? #e05a4a
                                         : row.status == "Running" ? #2dbfa8
+                                        : row.status == "TimedOut" ? #d08a2c
                                         : #a0a0a8;
                                     font-size: 13px;
                                     font-weight: 600;
@@ -271,6 +273,14 @@ export component MainWindow inherits Window {
 
                     Text { text: "If already running"; color: #a0a0a8; }
                     ComboBox { model: ["Skip", "Queue", "Parallel"]; current-index <=> root.edit-overlap; }
+
+                    Text { text: "Timeout"; color: #a0a0a8; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Kill after"; color: #ccc; vertical-alignment: center; }
+                        SpinBox { minimum: 0; maximum: 604800; value <=> root.edit-timeout; }
+                        Text { text: "seconds (0 = no limit)"; color: #ccc; vertical-alignment: center; }
+                    }
 
                     Text { text: "Working directory (blank = home)"; color: #a0a0a8; }
                     LineEdit { placeholder-text: root.edit-working-dir == "" ? "default: your home directory" : ""; text <=> root.edit-working-dir; }

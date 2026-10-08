@@ -38,10 +38,17 @@ impl Schedule {
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match self {
             Schedule::Interval { seconds } => Some(after + Duration::seconds(*seconds)),
-            Schedule::Cron { expr } => cron::Schedule::from_str(&normalize_cron(expr))
-                .ok()?
-                .after(&after)
-                .next(),
+            Schedule::Cron { expr } => {
+                // The cron crate matches fields against the datetime's own
+                // timezone, so evaluate in local time (users enter cron
+                // expressions in wall-clock terms, not UTC).
+                let local = after.with_timezone(&Local);
+                cron::Schedule::from_str(&normalize_cron(expr))
+                    .ok()?
+                    .after(&local)
+                    .next()
+                    .map(|t| t.with_timezone(&Utc))
+            }
             Schedule::Once { at } => {
                 if *at > after {
                     Some(*at)
@@ -148,6 +155,7 @@ pub enum LastStatus {
     Failed,
     Skipped,
     Expired,
+    TimedOut,
 }
 
 impl LastStatus {
@@ -159,6 +167,7 @@ impl LastStatus {
             LastStatus::Failed => "Failed",
             LastStatus::Skipped => "Skipped",
             LastStatus::Expired => "Expired",
+            LastStatus::TimedOut => "TimedOut",
         }
     }
     pub fn from_str_lossy(s: &str) -> Self {
@@ -168,6 +177,7 @@ impl LastStatus {
             "Failed" => LastStatus::Failed,
             "Skipped" => LastStatus::Skipped,
             "Expired" => LastStatus::Expired,
+            "TimedOut" => LastStatus::TimedOut,
             _ => LastStatus::Never,
         }
     }
@@ -177,6 +187,12 @@ impl LastStatus {
 pub struct EnvVar {
     pub key: String,
     pub value: String,
+}
+
+/// Default per-rule timeout in seconds: 5 minutes. Applied to new rules and to
+/// imported rules that predate the field.
+pub fn default_timeout_secs() -> i64 {
+    300
 }
 
 /// A scheduled task.
@@ -194,6 +210,9 @@ pub struct Rule {
     pub working_dir: Option<String>,
     pub env: Vec<EnvVar>,
     pub created_at: DateTime<Utc>,
+    /// Kill the job after this many seconds; 0 = no limit.
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: i64,
 
     // Runtime state (persisted).
     #[serde(default)]
@@ -220,6 +239,7 @@ impl Rule {
             working_dir: None,
             env: Vec::new(),
             created_at: Utc::now(),
+            timeout_secs: default_timeout_secs(),
             last_run: None,
             next_run: None,
             last_exit_code: None,
@@ -233,6 +253,9 @@ impl Rule {
         }
         if self.command.trim().is_empty() {
             return Err("Command must not be empty".into());
+        }
+        if self.timeout_secs < 0 {
+            return Err("Timeout must be 0 (no limit) or a positive number of seconds".into());
         }
         if let ShellKind::Custom { path, arg_template } = &self.shell {
             if path.trim().is_empty() {
@@ -262,7 +285,7 @@ pub struct RunRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
 
     #[test]
     fn normalize_cron_adds_seconds_field() {
@@ -293,10 +316,41 @@ mod tests {
     }
 
     #[test]
+    fn cron_next_after_is_evaluated_in_local_time() {
+        let s = Schedule::Cron { expr: "0 9 * * *".into() };
+        let next = s.next_after(Utc::now()).expect("cron should fire");
+        assert_eq!(
+            next.with_timezone(&Local).hour(),
+            9,
+            "cron must be interpreted in local time, not UTC"
+        );
+    }
+
+    #[test]
     fn rule_validation() {
         let mut r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
         assert!(r.validate().is_ok());
         r.command = "  ".into();
         assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn rule_default_timeout_is_300_seconds() {
+        let r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        assert_eq!(r.timeout_secs, 300, "new rules must have a default timeout");
+    }
+
+    #[test]
+    fn rule_rejects_negative_timeout() {
+        let mut r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        r.timeout_secs = -1;
+        assert!(r.validate().is_err());
+    }
+
+    #[test]
+    fn last_status_timed_out_roundtrips() {
+        assert_eq!(LastStatus::TimedOut.as_str(), "TimedOut");
+        assert_eq!(LastStatus::from_str_lossy("TimedOut"), LastStatus::TimedOut);
+        assert_eq!(LastStatus::from_str_lossy("unknown"), LastStatus::Never);
     }
 }

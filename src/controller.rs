@@ -7,7 +7,7 @@ use crate::shell::ShellCatalog;
 use crate::storage::Store;
 use crate::{MainWindow, RuleRow, RunRow};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -102,6 +102,18 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
         .collect()
 }
 
+/// Load the captured output for the currently selected run into the model so
+/// the log view shows it without pulling every row's bodies on each refresh.
+fn fill_selected_run(store: &Store, ui: &MainWindow, model: &Rc<VecModel<RunRow>>) {
+    let idx = ui.get_selected_run_index() as usize;
+    let Some(mut row) = model.row_data(idx) else { return };
+    let Ok(id) = row.id.parse::<i64>() else { return };
+    let Ok(Some(full)) = store.get_run(id) else { return };
+    row.stdout = full.stdout.into();
+    row.stderr = full.stderr.into();
+    model.set_row_data(idx, row);
+}
+
 fn parse_env(text: &str) -> Vec<EnvVar> {
     text.lines()
         .filter_map(|line| {
@@ -110,8 +122,12 @@ fn parse_env(text: &str) -> Vec<EnvVar> {
                 return None;
             }
             let (k, v) = line.split_once('=')?;
+            let key = k.trim();
+            if key.is_empty() {
+                return None;
+            }
             Some(EnvVar {
-                key: k.trim().to_string(),
+                key: key.to_string(),
                 value: v.to_string(),
             })
         })
@@ -194,9 +210,14 @@ fn build_shell(ui: &MainWindow, opts: &ShellOptions) -> Result<ShellKind, String
     }
 }
 
-fn refresh_rules(ui: &MainWindow, store: &Store, catalog: &ShellCatalog, engine: &EngineHandle) {
-    let rows = build_rule_rows(store, catalog);
-    ui.set_rules(ModelRc::new(VecModel::from(rows)));
+fn refresh_rules(
+    ui: &MainWindow,
+    store: &Store,
+    catalog: &ShellCatalog,
+    engine: &EngineHandle,
+    rules_model: &Rc<VecModel<RuleRow>>,
+) {
+    rules_model.set_vec(build_rule_rows(store, catalog));
     ui.set_paused(engine.is_paused());
 }
 
@@ -214,7 +235,14 @@ pub fn setup(
 
     let current_logs_rule: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
 
-    refresh_rules(ui, &store, &catalog, &engine);
+    // Persistent model instances: updates happen in place (set_vec), so the UI
+    // keeps scroll/selection state instead of being re-bound every second.
+    let rules_model = Rc::new(VecModel::<RuleRow>::default());
+    let runs_model = Rc::new(VecModel::<RunRow>::default());
+    ui.set_rules(ModelRc::new(rules_model.clone()));
+    ui.set_runs(ModelRc::new(runs_model.clone()));
+
+    refresh_rules(ui, &store, &catalog, &engine, &rules_model);
 
     // --- Add ---
     {
@@ -238,6 +266,7 @@ pub fn setup(
             ui.set_edit_overlap(0);
             ui.set_edit_working_dir("".into());
             ui.set_edit_env("".into());
+            ui.set_edit_timeout(crate::model::default_timeout_secs() as i32);
             ui.set_edit_error("".into());
             ui.set_active_view(1);
         });
@@ -303,6 +332,7 @@ pub fn setup(
             });
             ui.set_edit_working_dir(rule.working_dir.clone().unwrap_or_default().into());
             ui.set_edit_env(env_to_text(&rule.env).into());
+            ui.set_edit_timeout(rule.timeout_secs.clamp(0, 604_800) as i32);
             ui.set_edit_error("".into());
             ui.set_active_view(1);
         });
@@ -315,6 +345,7 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let opts = opts.clone();
+        let rules_model = rules_model.clone();
         ui.on_save_rule(move || {
             let Some(ui) = weak.upgrade() else { return };
             let shell = match build_shell(&ui, &opts) {
@@ -369,6 +400,7 @@ pub fn setup(
             let wd = ui.get_edit_working_dir().to_string();
             rule.working_dir = if wd.trim().is_empty() { None } else { Some(wd) };
             rule.env = parse_env(&ui.get_edit_env());
+            rule.timeout_secs = ui.get_edit_timeout() as i64;
 
             if let Err(e) = rule.validate() {
                 ui.set_edit_error(e.into());
@@ -381,7 +413,7 @@ pub fn setup(
             engine.reload_rule(rule.id);
             ui.set_edit_error("".into());
             ui.set_active_view(0);
-            refresh_rules(&ui, &store, &catalog, &engine);
+            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
         });
     }
 
@@ -402,6 +434,7 @@ pub fn setup(
         let store = store.clone();
         let engine = engine.clone();
         let catalog = catalog.clone();
+        let rules_model = rules_model.clone();
         ui.on_request_delete(move |id| {
             let Some(ui) = weak.upgrade() else { return };
             let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
@@ -415,7 +448,7 @@ pub fn setup(
             }
             let _ = store.delete_rule(uuid);
             engine.remove_rule(uuid);
-            refresh_rules(&ui, &store, &catalog, &engine);
+            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
         });
     }
 
@@ -435,12 +468,13 @@ pub fn setup(
         let store = store.clone();
         let engine = engine.clone();
         let catalog = catalog.clone();
+        let rules_model = rules_model.clone();
         ui.on_request_toggle_enabled(move |id, enabled| {
             let Some(ui) = weak.upgrade() else { return };
             let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
             let _ = store.set_enabled(uuid, enabled);
             engine.reload_rule(uuid);
-            refresh_rules(&ui, &store, &catalog, &engine);
+            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
         });
     }
 
@@ -449,6 +483,7 @@ pub fn setup(
         let weak = ui.as_weak();
         let store = store.clone();
         let current = current_logs_rule.clone();
+        let runs_model = runs_model.clone();
         ui.on_request_open_logs(move |id| {
             let Some(ui) = weak.upgrade() else { return };
             let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
@@ -461,7 +496,8 @@ pub fn setup(
                 .unwrap_or_default();
             ui.set_logs_rule_name(name.into());
             ui.set_selected_run_index(0);
-            ui.set_runs(ModelRc::new(VecModel::from(build_run_rows(&store, uuid))));
+            runs_model.set_vec(build_run_rows(&store, uuid));
+            fill_selected_run(&store, &ui, &runs_model);
             ui.set_active_view(2);
         });
     }
@@ -492,16 +528,16 @@ pub fn setup(
         ui.on_save_settings(move || {
             let Some(ui) = weak.upgrade() else { return };
             let want = ui.get_setting_autostart();
-            let msg = if want {
+            let (msg, stored) = if want {
                 match autostart::enable() {
-                    Ok(_) => "Saved. Launch at login is on.",
-                    Err(_) => "Saved, but enabling autostart failed.",
+                    Ok(_) => ("Saved. Launch at login is on.".to_string(), "1"),
+                    Err(_) => ("Saved, but enabling autostart failed.".to_string(), "0"),
                 }
             } else {
                 let _ = autostart::disable();
-                "Saved. Launch at login is off."
+                ("Saved. Launch at login is off.".to_string(), "0")
             };
-            let _ = store.setting_set("autostart", if want { "1" } else { "0" });
+            let _ = store.setting_set("autostart", stored);
             let days = ui.get_setting_retention_days();
             let _ = store.setting_set("history_retention_days", &days.to_string());
             let _ = store.prune_history(days as i64);
@@ -543,18 +579,38 @@ pub fn setup(
         let store = store.clone();
         let engine = engine.clone();
         let catalog = catalog.clone();
+        let rules_model = rules_model.clone();
         ui.on_import_rules(move || {
             let Some(ui) = weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
                 match std::fs::read(&path) {
                     Ok(bytes) => match serde_json::from_slice::<Vec<Rule>>(&bytes) {
                         Ok(rules) => {
+                            let mut imported = 0usize;
+                            let mut skipped = 0usize;
                             for r in &rules {
-                                let _ = store.upsert_rule(r);
+                                if let Err(e) = r.validate() {
+                                    skipped += 1;
+                                    log::warn!(
+                                        "import skipped invalid rule '{}': {e}",
+                                        r.name
+                                    );
+                                    continue;
+                                }
+                                if store.upsert_rule(r).is_ok() {
+                                    imported += 1;
+                                } else {
+                                    skipped += 1;
+                                }
                             }
                             engine.reload_all();
-                            refresh_rules(&ui, &store, &catalog, &engine);
-                            ui.set_settings_status(format!("Imported {} rules.", rules.len()).into());
+                            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+                            let msg = if skipped > 0 {
+                                format!("Imported {imported} rules ({skipped} invalid skipped).")
+                            } else {
+                                format!("Imported {imported} rules.")
+                            };
+                            ui.set_settings_status(msg.into());
                         }
                         Err(e) => ui.set_settings_status(format!("Import failed: {e}").into()),
                     },
@@ -606,19 +662,22 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let current = current_logs_rule.clone();
+        let rules_model = rules_model.clone();
+        let runs_model = runs_model.clone();
         timer.start(TimerMode::Repeated, Duration::from_millis(1000), move || {
             let Some(ui) = weak.upgrade() else { return };
             let view = ui.get_active_view();
             if view == 0 {
-                refresh_rules(&ui, &store, &catalog, &engine);
+                refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
             } else {
                 // keep the paused indicator fresh everywhere
                 ui.set_paused(engine.is_paused());
             }
-            if view == 2 {
-                if let Some(uuid) = *current.borrow() {
-                    ui.set_runs(ModelRc::new(VecModel::from(build_run_rows(&store, uuid))));
-                }
+            if view == 2
+                && let Some(uuid) = *current.borrow()
+            {
+                runs_model.set_vec(build_run_rows(&store, uuid));
+                fill_selected_run(&store, &ui, &runs_model);
             }
         });
     }

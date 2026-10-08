@@ -91,7 +91,8 @@ struct Engine {
     base_env: Arc<BaseEnv>,
     armed: HashMap<Uuid, DateTime<Utc>>,
     rules: HashMap<Uuid, Rule>,
-    running: HashSet<Uuid>,
+    /// Number of in-flight runs per rule (Parallel can run several at once).
+    running: HashMap<Uuid, usize>,
     pending: HashSet<Uuid>,
     paused: Arc<AtomicBool>,
     jobdone_tx: mpsc::Sender<JobDone>,
@@ -179,6 +180,16 @@ impl Engine {
         }
         let next = match &schedule {
             Schedule::Once { .. } => None,
+            Schedule::Interval { seconds } => {
+                // Anchor on the scheduled time that just fired so the cadence
+                // keeps its phase instead of drifting by wake-up jitter.
+                let anchor = self.armed.get(&id).copied().unwrap_or(now);
+                let mut t = anchor + ChronoDuration::seconds(*seconds);
+                if t <= now {
+                    t = now + ChronoDuration::seconds(*seconds);
+                }
+                Some(t)
+            }
             s => s.next_after(now),
         };
         match next {
@@ -201,7 +212,7 @@ impl Engine {
         if !rule.enabled {
             return;
         }
-        if self.running.contains(&id) {
+        if self.running.get(&id).copied().unwrap_or(0) > 0 {
             match rule.overlap {
                 OverlapPolicy::Skip => {
                     log::info!("skip overlapping run for '{}'", rule.name);
@@ -221,12 +232,13 @@ impl Engine {
     fn spawn_job(&mut self, rule: Rule, trigger: &'static str) {
         let id = rule.id;
         let now = Utc::now();
-        self.running.insert(id);
+        let running_count = self.running.get(&id).copied().unwrap_or(0);
+        self.running.insert(id, running_count + 1);
         let run_id = match self.store.begin_run(id, now, trigger) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("begin_run failed: {e}");
-                self.running.remove(&id);
+                self.decrement_running(&id);
                 return;
             }
         };
@@ -252,6 +264,22 @@ impl Engine {
         });
     }
 
+    /// Decrement the in-flight counter for a rule; returns whether other
+    /// instances of the same rule are still running.
+    fn decrement_running(&mut self, id: &Uuid) -> bool {
+        match self.running.get_mut(id) {
+            Some(c) => {
+                *c -= 1;
+                let still = *c > 0;
+                if !still {
+                    self.running.remove(id);
+                }
+                still
+            }
+            None => false,
+        }
+    }
+
     fn handle_done(&mut self, done: JobDone) {
         let JobDone {
             rule_id,
@@ -259,8 +287,9 @@ impl Engine {
             outcome,
             finished,
         } = done;
-        self.running.remove(&rule_id);
-        let status = if outcome.success {
+        let status = if outcome.timed_out {
+            LastStatus::TimedOut
+        } else if outcome.success {
             LastStatus::Success
         } else {
             LastStatus::Failed
@@ -273,22 +302,31 @@ impl Engine {
             &outcome.stdout,
             &outcome.stderr,
         );
-        let _ = self.store.set_result(rule_id, outcome.exit_code, status);
-        if let Some(r) = self.rules.get_mut(&rule_id) {
-            r.last_exit_code = outcome.exit_code;
-            r.last_status = status;
-        }
-        log::info!(
-            "finished '{}' -> {} (exit {:?})",
-            self.rules.get(&rule_id).map(|r| r.name.as_str()).unwrap_or("?"),
-            status.as_str(),
-            outcome.exit_code
-        );
-        // A queued run was requested while this one was in flight.
-        if self.pending.remove(&rule_id) {
-            if let Some(rule) = self.rules.get(&rule_id).cloned() {
+        let still_running = self.decrement_running(&rule_id);
+        if !still_running {
+            let _ = self.store.set_result(rule_id, outcome.exit_code, status);
+            if let Some(r) = self.rules.get_mut(&rule_id) {
+                r.last_exit_code = outcome.exit_code;
+                r.last_status = status;
+            }
+            log::info!(
+                "finished '{}' -> {} (exit {:?})",
+                self.rules.get(&rule_id).map(|r| r.name.as_str()).unwrap_or("?"),
+                status.as_str(),
+                outcome.exit_code
+            );
+            // A queued run was requested while a run was in flight.
+            if self.pending.remove(&rule_id)
+                && let Some(rule) = self.rules.get(&rule_id).cloned()
+            {
                 self.spawn_job(rule, "queued");
             }
+        } else {
+            log::info!(
+                "parallel run of '{}' finished; {} still running",
+                self.rules.get(&rule_id).map(|r| r.name.as_str()).unwrap_or("?"),
+                self.running.get(&rule_id).copied().unwrap_or(0)
+            );
         }
     }
 
@@ -328,11 +366,14 @@ impl Engine {
                 self.rules.remove(&id);
                 self.armed.remove(&id);
                 self.pending.remove(&id);
+                self.running.remove(&id);
             }
             Ctrl::RunNow(id) => {
                 if let Ok(Some(rule)) = self.store.get_rule(id) {
-                    self.rules.insert(id, rule.clone());
-                    self.spawn_job(rule, "manual");
+                    self.rules.insert(id, rule);
+                    // Route through fire() so manual runs respect the rule's
+                    // enabled flag and overlap policy (Skip/Queue/Parallel).
+                    self.fire(id, "manual");
                 }
             }
             Ctrl::PauseAll => {
@@ -372,10 +413,10 @@ impl Engine {
             .flatten()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(30);
-        if let Ok(n) = self.store.prune_history(days) {
-            if n > 0 {
-                log::info!("pruned {n} old run records");
-            }
+        if let Ok(n) = self.store.prune_history(days)
+            && n > 0
+        {
+            log::info!("pruned {n} old run records");
         }
     }
 
@@ -432,7 +473,7 @@ pub fn create(
         base_env,
         armed: HashMap::new(),
         rules: HashMap::new(),
-        running: HashSet::new(),
+        running: HashMap::new(),
         pending: HashSet::new(),
         paused: paused.clone(),
         jobdone_tx,
@@ -474,6 +515,35 @@ mod tests {
         assert!(
             runs.iter().any(|r| r.success),
             "expected at least one successful run"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_now_respects_disabled_rule() {
+        let store = Store::open_in_memory().unwrap();
+        let mut rule = Rule::new(
+            "t".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 60 },
+        );
+        rule.enabled = false;
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, fut) = create(
+            store.clone(),
+            Arc::new(ShellCatalog::detect()),
+            Arc::new(BaseEnv::resolve()),
+        );
+        let jh = tokio::spawn(fut);
+        handle.run_now(rule.id);
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        handle.shutdown();
+        let _ = jh.await;
+
+        assert!(
+            store.list_runs(rule.id, 10).unwrap().is_empty(),
+            "manual run must not start a disabled rule"
         );
     }
 }

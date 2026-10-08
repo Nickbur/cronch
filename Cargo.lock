@@ -1091,6 +1091,7 @@ dependencies = [
  "directories",
  "env_logger",
  "image",
+ "libc",
  "log",
  "rfd",
  "rusqlite",

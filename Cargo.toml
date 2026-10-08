@@ -32,7 +32,7 @@ serde_json = "1.0.151"
 shell-words = "1.1.1"
 single-instance = "0.3.3"
 slint = "1.17.1"
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "time", "sync", "io-util"] }
 tray-icon = "0.24.2"
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
 
@@ -42,3 +42,7 @@ slint-build = "1.17.1"
 # Windows-only: embeds assets/icon.ico into the .exe (Explorer/taskbar icon).
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
+
+# Unix-only: kill a job's whole process group on timeout.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
