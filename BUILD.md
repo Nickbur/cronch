@@ -30,6 +30,27 @@ contains `Cargo.toml`.
 
 ---
 
+## Development commands (optional)
+
+A `package.json` lists the everyday commands. It is a command list only — the
+project itself is pure Rust:
+
+```bash
+npm run serve           # build and run the app (cargo run)
+npm run fix             # auto-format + auto-fix lints (cargo fmt, cargo clippy --fix)
+npm run build           # full check: clippy -D warnings + release tests + release build
+npm run re-install-npm  # clean rebuild (cargo clean && cargo build)
+```
+
+The repo ships Git hooks (`.githooks/`) that reject accidental files and enforce
+Conventional Commit messages. Wire them once per clone:
+
+```bash
+npm run prepare   # or: git config core.hooksPath .githooks
+```
+
+---
+
 ## Part 1 — Windows
 
 ### 1. Install the C++ build tools (the linker)
@@ -218,8 +239,10 @@ scheduled command and records the result).
 Cronch. To produce installers/bundles for other people —
 a Windows `.exe`/`.msi` or a macOS `.app`/`.dmg` — use a packaging tool such as
 [`cargo-bundle`](https://crates.io/crates/cargo-bundle) or
-[`cargo-dist`](https://crates.io/crates/cargo-dist). That's beyond this build
-guide.
+[`cargo-dist`](https://crates.io/crates/cargo-dist). Cronch already declares its
+bundle metadata in `Cargo.toml` (`[package.metadata.bundle]`: name, bundle id,
+`assets/icon.icns`), so on macOS `cargo bundle --release` works out of the box.
+Windows packaging is beyond this build guide.
 
 ---
 

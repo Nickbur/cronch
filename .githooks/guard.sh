@@ -11,15 +11,16 @@ limit=2097152
 tab=$(printf '\t')
 
 # Each problem prints one line; the loop runs in a subshell, so problems are collected as output.
+# Case patterns inside $( ) keep the optional leading "(": bash 3.2 (macOS /bin/sh) misreads a bare ")".
 problems=$(
     git -c core.quotePath=false diff --cached --name-status --diff-filter=ACMR |
         while IFS="$tab" read -r status path rest; do
             # Renames/copies carry "old<TAB>new"; check the new path.
-            case "$status" in R* | C*) path=$rest ;; esac
+            case "$status" in (R* | C*) path=$rest ;; esac
             name=${path##*/}
 
             case "$name" in
-                *[\'\"\`{}\;\|\<\>]* | *=\>*) echo "suspicious file name: $path" ;;
+                (*[\'\"\`{}\;\|\<\>]* | *=\>*) echo "suspicious file name: $path" ;;
             esac
             opened=$(($(printf '%s' "$name" | tr -cd '([' | wc -c)))
             closed=$(($(printf '%s' "$name" | tr -cd ')]' | wc -c)))
@@ -28,8 +29,8 @@ problems=$(
             size=$(($(git cat-file -s ":$path" 2>/dev/null || echo 0)))
             if [ "$status" = A ] && [ "$size" -eq 0 ]; then
                 case "$name" in
-                    .gitkeep | .keep | .nojekyll | __init__.py | py.typed | *.*) ;;
-                    *) echo "new empty file without an extension: $path" ;;
+                    (.gitkeep | .keep | .nojekyll | __init__.py | py.typed | *.*) ;;
+                    (*) echo "new empty file without an extension: $path" ;;
                 esac
             fi
 
@@ -37,9 +38,9 @@ problems=$(
                 allowed=0
                 if [ -f "$allow" ]; then
                     while IFS= read -r pattern; do
-                        case "$pattern" in '' | '#'*) continue ;; esac
+                        case "$pattern" in ('' | '#'*) continue ;; esac
                         # shellcheck disable=SC2254
-                        case "$path" in $pattern) allowed=1 ;; esac
+                        case "$path" in ($pattern) allowed=1 ;; esac
                     done <"$allow"
                 fi
                 [ "$allowed" = 1 ] || echo "file over 2 MB: $path ($size bytes) — list it in $allow if intended"

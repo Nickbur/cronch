@@ -5,10 +5,18 @@ edition = "2024"
 description = "A cross-platform (Windows & macOS) system-tray task scheduler."
 authors = ["burakov"]
 homepage = "https://burakov.net"
+repository = "https://github.com/Nickbur/cronch"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 keywords = ["scheduler", "cron", "tray", "automation", "tasks"]
 categories = ["gui"]
+
+# macOS .app packaging via `cargo bundle` (see BUILD.md). Points at the bundled
+# brand icon so the asset is actually used rather than sitting dead in the repo.
+[package.metadata.bundle]
+name = "Cronch"
+identifier = "net.burakov.Cronch"
+icon = ["assets/icon.icns"]
 
 [profile.release]
 opt-level = "z"

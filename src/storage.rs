@@ -3,7 +3,7 @@
 use crate::model::{EnvVar, LastStatus, OverlapPolicy, Rule, RunRecord, Schedule, ShellKind};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -112,8 +112,7 @@ struct RawRule {
 
 impl RawRule {
     fn into_rule(self) -> Result<Rule> {
-        let shell: ShellKind =
-            serde_json::from_str(&self.shell).context("decode shell json")?;
+        let shell: ShellKind = serde_json::from_str(&self.shell).context("decode shell json")?;
         let schedule: Schedule =
             serde_json::from_str(&self.schedule).context("decode schedule json")?;
         let env: Vec<EnvVar> = serde_json::from_str(&self.env).context("decode env json")?;
@@ -500,7 +499,9 @@ mod tests {
         ensure_schema(&conn).unwrap();
 
         let timeout: i64 = conn
-            .query_row("SELECT timeout_secs FROM rules WHERE id = 'x'", [], |r| r.get(0))
+            .query_row("SELECT timeout_secs FROM rules WHERE id = 'x'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(timeout, 300, "migrated rows must get the default timeout");
     }
@@ -508,11 +509,18 @@ mod tests {
     #[test]
     fn run_history_roundtrip() {
         let store = Store::open_in_memory().unwrap();
-        let rule = Rule::new("r".into(), "echo".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         store.upsert_rule(&rule).unwrap();
         let started = Utc::now();
         let run_id = store.begin_run(rule.id, started, "manual").unwrap();
-        store.finish_run(run_id, Utc::now(), Some(0), true, "out", "").unwrap();
+        store
+            .finish_run(run_id, Utc::now(), Some(0), true, "out", "")
+            .unwrap();
         let runs = store.list_runs(rule.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, run_id);
@@ -525,7 +533,12 @@ mod tests {
     #[test]
     fn reconcile_closes_orphaned_runs_and_status() {
         let store = Store::open_in_memory().unwrap();
-        let rule = Rule::new("r".into(), "echo".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         store.upsert_rule(&rule).unwrap();
         store.mark_running(rule.id, Utc::now()).unwrap();
         let run_id = store.begin_run(rule.id, Utc::now(), "schedule").unwrap();
@@ -539,7 +552,11 @@ mod tests {
         assert!(run.stderr.contains("interrupted"));
 
         let got = store.get_rule(rule.id).unwrap().unwrap();
-        assert_eq!(got.last_status, LastStatus::Never, "stale Running status must reset");
+        assert_eq!(
+            got.last_status,
+            LastStatus::Never,
+            "stale Running status must reset"
+        );
     }
 
     #[test]

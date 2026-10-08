@@ -26,7 +26,12 @@ impl BaseEnv {
 
 fn lossy_env() -> Vec<(String, String)> {
     std::env::vars_os()
-        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
         .collect()
 }
 
@@ -57,22 +62,30 @@ fn resolve_platform() -> Vec<(String, String)> {
 }
 
 /// Run `$SHELL -l -c env` on a helper thread, bounded by a timeout so a slow
-/// or hanging login shell cannot block app startup.
+/// or hanging login shell cannot block app startup. If the shell exceeds the
+/// timeout it is killed, so the helper thread can wind down instead of leaking.
 #[cfg(not(windows))]
 fn query_login_env(shell: &str) -> std::collections::HashMap<String, String> {
     use std::collections::HashMap;
 
     let mut out = HashMap::new();
+    let child = std::process::Command::new(shell)
+        .arg("-l")
+        .arg("-c")
+        .arg("env")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let child = match child {
+        Ok(c) => c,
+        Err(_) => return out,
+    };
+    let pid = child.id();
+
     let (tx, rx) = std::sync::mpsc::channel();
-    let shell = shell.to_string();
     std::thread::spawn(move || {
-        let _ = tx.send(
-            std::process::Command::new(&shell)
-                .arg("-l")
-                .arg("-c")
-                .arg("env")
-                .output(),
-        );
+        let _ = tx.send(child.wait_with_output());
     });
     match rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(output)) if output.status.success() => {
@@ -83,7 +96,15 @@ fn query_login_env(shell: &str) -> std::collections::HashMap<String, String> {
                 }
             }
         }
-        _ => {}
+        _ => {
+            #[cfg(unix)]
+            {
+                // Kill the stuck shell so the helper thread finishes.
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+            }
+        }
     }
     out
 }

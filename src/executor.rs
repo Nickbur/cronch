@@ -31,19 +31,16 @@ impl Outcome {
     }
 }
 
-/// Expand an argument template, replacing the `{cmd}` token with `command` as a
-/// single argument (the shell parses it — we never split the user command).
-fn render_template(template: &str, command: &str) -> Vec<String> {
-    template
-        .split_whitespace()
-        .map(|tok| {
-            if tok == "{cmd}" {
-                command.to_string()
-            } else {
-                tok.to_string()
-            }
-        })
-        .collect()
+/// Expand an argument template, replacing the `{cmd}` placeholder with
+/// `command` as a single argument (the shell parses it — we never split the
+/// user command). The template is word-split with shell-like quoting so
+/// `-c {cmd}`, `-c "{cmd}"` and `--opt={cmd}` all behave as written.
+fn render_template(template: &str, command: &str) -> Result<Vec<String>, String> {
+    let words = crate::model::parse_arg_template(template)?;
+    Ok(words
+        .into_iter()
+        .map(|w| w.replace(crate::model::CMD_PLACEHOLDER, command))
+        .collect())
 }
 
 fn resolve_program_args(
@@ -59,18 +56,25 @@ fn resolve_program_args(
             Ok((program, it.collect()))
         }
         ShellKind::Custom { path, arg_template } => {
-            Ok((path.clone(), render_template(arg_template, &rule.command)))
+            Ok((path.clone(), render_template(arg_template, &rule.command)?))
         }
         ShellKind::Detected { key } => {
             let info = catalog
                 .get(key)
                 .ok_or_else(|| format!("shell '{key}' not found on this machine"))?;
-            Ok((info.path.clone(), render_template(&info.arg_template, &rule.command)))
+            Ok((
+                info.path.clone(),
+                render_template(&info.arg_template, &rule.command)?,
+            ))
         }
     }
 }
 
-fn build_command(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) -> Result<Command, String> {
+fn build_command(
+    rule: &Rule,
+    catalog: &ShellCatalog,
+    base_env: &BaseEnv,
+) -> Result<Command, String> {
     let (program, args) = resolve_program_args(rule, catalog)?;
 
     let mut cmd = Command::new(&program);
@@ -193,10 +197,34 @@ async fn capture_opt<R: tokio::io::AsyncRead + Unpin>(stream: Option<R>) -> (Str
 
 enum RunResult {
     Done(std::io::Result<std::process::ExitStatus>, String, String),
-    TimedOut { secs: i64, stdout: String, stderr: String },
+    TimedOut {
+        secs: i64,
+        stdout: String,
+        stderr: String,
+    },
+    Cancelled {
+        stdout: String,
+        stderr: String,
+    },
 }
 
-pub async fn execute(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) -> Outcome {
+/// Wait (bounded) for a killed job's drain task to hand back whatever it read,
+/// so a double-forked survivor holding the pipes open cannot hang shutdown.
+async fn reap(
+    job: &mut tokio::task::JoinHandle<(std::io::Result<std::process::ExitStatus>, String, String)>,
+) -> (String, String) {
+    match tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut *job).await {
+        Ok(Ok((_status, o, e))) => (o, e),
+        _ => (String::new(), String::new()),
+    }
+}
+
+pub async fn execute(
+    rule: &Rule,
+    catalog: &ShellCatalog,
+    base_env: &BaseEnv,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Outcome {
     let mut cmd = match build_command(rule, catalog, base_env) {
         Ok(c) => c,
         Err(e) => return Outcome::error(e),
@@ -214,7 +242,8 @@ pub async fn execute(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) ->
 
     // Wait for the process while draining both pipes concurrently (a full
     // pipe would otherwise block the child forever). Runs in a task so the
-    // timeout branch can kill the group and then wait for this to wind down.
+    // timeout/cancel branches can kill the group and then wait for this to
+    // wind down.
     let mut job = tokio::spawn(async move {
         let wait_fut = child.wait();
         let so_fut = capture_opt(stdout);
@@ -224,10 +253,7 @@ pub async fn execute(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) ->
     });
 
     let deadline = if timeout_secs > 0 {
-        Some(
-            tokio::time::Instant::now()
-                + tokio::time::Duration::from_secs(timeout_secs as u64),
-        )
+        Some(tokio::time::Instant::now() + tokio::time::Duration::from_secs(timeout_secs as u64))
     } else {
         None
     };
@@ -240,21 +266,25 @@ pub async fn execute(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) ->
             },
             _ = tokio::time::sleep_until(dl) => {
                 kill_group(pid).await;
-                // Wait for the drained result; guard against a double-forked
-                // survivor that keeps the pipes open forever.
-                let (o, e) = match tokio::time::timeout(
-                    tokio::time::Duration::from_secs(2),
-                    &mut job,
-                ).await {
-                    Ok(Ok((_status, o, e))) => (o, e),
-                    _ => (String::new(), String::new()),
-                };
+                let (o, e) = reap(&mut job).await;
                 RunResult::TimedOut { secs: timeout_secs, stdout: o, stderr: e }
             }
+            _ = shutdown.changed() => {
+                kill_group(pid).await;
+                let (o, e) = reap(&mut job).await;
+                RunResult::Cancelled { stdout: o, stderr: e }
+            }
         },
-        None => match job.await {
-            Ok((status, o, e)) => RunResult::Done(status, o, e),
-            Err(e) => RunResult::Done(Err(std::io::Error::other(e)), String::new(), String::new()),
+        None => tokio::select! {
+            r = &mut job => match r {
+                Ok((status, o, e)) => RunResult::Done(status, o, e),
+                Err(e) => RunResult::Done(Err(std::io::Error::other(e)), String::new(), String::new()),
+            },
+            _ = shutdown.changed() => {
+                kill_group(pid).await;
+                let (o, e) = reap(&mut job).await;
+                RunResult::Cancelled { stdout: o, stderr: e }
+            }
         },
     };
 
@@ -269,7 +299,11 @@ pub async fn execute(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) ->
             },
             Err(e) => Outcome::error(format!("process error: {e}")),
         },
-        RunResult::TimedOut { secs, stdout, stderr } => {
+        RunResult::TimedOut {
+            secs,
+            stdout,
+            stderr,
+        } => {
             let note = format!("cronch: killed after {secs}s (timeout)");
             let stderr = if stderr.is_empty() {
                 note
@@ -284,6 +318,21 @@ pub async fn execute(rule: &Rule, catalog: &ShellCatalog, base_env: &BaseEnv) ->
                 timed_out: true,
             }
         }
+        RunResult::Cancelled { stdout, stderr } => {
+            let note = "cronch: cancelled (app is shutting down)";
+            let stderr = if stderr.is_empty() {
+                note.to_string()
+            } else {
+                format!("{stderr}\n{note}")
+            };
+            Outcome {
+                exit_code: None,
+                success: false,
+                stdout,
+                stderr,
+                timed_out: false,
+            }
+        }
     }
 }
 
@@ -292,26 +341,49 @@ mod tests {
     use super::*;
     use crate::model::Schedule;
 
+    /// Run a rule with a never-fired shutdown channel (the sender stays alive
+    /// for the duration of the call, so the job is never cancelled).
+    async fn run_rule(rule: &Rule) -> Outcome {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        execute(rule, &ShellCatalog::detect(), &BaseEnv::resolve(), rx).await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn direct_echo_captures_stdout() {
-        let cmd = if cfg!(windows) { "cmd /C echo hello123" } else { "echo hello123" };
+        let cmd = if cfg!(windows) {
+            "cmd /C echo hello123"
+        } else {
+            "echo hello123"
+        };
         let rule = Rule::new(
             "t".into(),
             cmd.into(),
             ShellKind::Direct,
             Schedule::Interval { seconds: 1 },
         );
-        let cat = ShellCatalog::detect();
-        let env = BaseEnv::resolve();
-        let out = execute(&rule, &cat, &env).await;
+        let out = run_rule(&rule).await;
         assert!(out.success, "stderr: {}", out.stderr);
         assert!(out.stdout.contains("hello123"), "stdout: {}", out.stdout);
     }
 
     #[test]
     fn template_keeps_command_as_single_arg() {
-        let args = render_template("-NoProfile -Command {cmd}", "echo a b c");
+        let args = render_template("-NoProfile -Command {cmd}", "echo a b c").unwrap();
         assert_eq!(args, vec!["-NoProfile", "-Command", "echo a b c"]);
+    }
+
+    #[test]
+    fn template_expands_placeholder_inside_quotes_and_words() {
+        // Quotes are consumed by word-splitting; the command stays one argument.
+        assert_eq!(
+            render_template("-c \"{cmd}\"", "echo a b").unwrap(),
+            vec!["-c", "echo a b"]
+        );
+        // The placeholder can be embedded in a larger word.
+        assert_eq!(
+            render_template("--eval={cmd}", "echo a").unwrap(),
+            vec!["--eval=echo a"]
+        );
     }
 
     #[cfg(unix)]
@@ -323,7 +395,7 @@ mod tests {
             ShellKind::Direct,
             Schedule::Interval { seconds: 60 },
         );
-        let out = execute(&rule, &ShellCatalog::detect(), &BaseEnv::resolve()).await;
+        let out = run_rule(&rule).await;
         assert!(out.success, "stderr: {}", out.stderr);
         assert!(
             out.stdout.len() <= MAX_CAPTURE + TRUNCATED_MARKER.len(),
@@ -343,7 +415,7 @@ mod tests {
         );
         rule.timeout_secs = 1;
         let start = std::time::Instant::now();
-        let out = execute(&rule, &ShellCatalog::detect(), &BaseEnv::resolve()).await;
+        let out = run_rule(&rule).await;
         assert!(out.timed_out, "expected the run to be killed by timeout");
         assert!(!out.success);
         assert_eq!(out.exit_code, None);
@@ -364,8 +436,32 @@ mod tests {
             Schedule::Interval { seconds: 60 },
         );
         rule.timeout_secs = 0;
-        let out = execute(&rule, &ShellCatalog::detect(), &BaseEnv::resolve()).await;
+        let out = run_rule(&rule).await;
         assert!(out.success, "stderr: {}", out.stderr);
         assert!(!out.timed_out);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_long_running_job() {
+        let rule = Rule::new(
+            "t".into(),
+            "sh -c 'sleep 60'".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 60 },
+        );
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(async move {
+            execute(&rule, &ShellCatalog::detect(), &BaseEnv::resolve(), rx).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        tx.send(true).unwrap();
+        let out = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("shutdown must not hang")
+            .unwrap();
+        assert!(!out.success);
+        assert!(!out.timed_out);
+        assert!(out.stderr.contains("cancelled"), "stderr: {}", out.stderr);
     }
 }

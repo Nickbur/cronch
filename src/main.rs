@@ -18,8 +18,8 @@ use anyhow::Result;
 use slint::{ComponentHandle, TimerMode};
 use std::sync::Arc;
 use std::time::Duration;
-use tray_icon::menu::MenuEvent;
 use tray_icon::TrayIconEvent;
+use tray_icon::menu::MenuEvent;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -57,13 +57,12 @@ fn main() -> Result<()> {
             log::warn!("could not enable autostart on first run: {e}");
         }
         let _ = store.setting_set("first_run_seen", "1");
-        let _ = store.setting_set("autostart", "1");
         let _ = store.setting_set("history_retention_days", "30");
     }
 
     // Scheduler engine on its own thread with a tokio runtime.
     let (handle_tx, handle_rx) = std::sync::mpsc::channel();
-    {
+    let engine_thread = {
         let store = store.clone();
         let catalog = catalog.clone();
         let base_env = base_env.clone();
@@ -79,8 +78,8 @@ fn main() -> Result<()> {
                     let _ = handle_tx.send(handle);
                     fut.await;
                 });
-            })?;
-    }
+            })?
+    };
     let engine = handle_rx.recv().expect("receive engine handle");
     engine.startup_load();
 
@@ -144,6 +143,10 @@ fn main() -> Result<()> {
     }
 
     slint::run_event_loop()?;
+    // Stop the engine and wait for it: it broadcasts a shutdown to in-flight
+    // jobs (killing their process groups) and closes their run rows before the
+    // process exits, so quitting leaves nothing running behind.
     engine.shutdown();
+    let _ = engine_thread.join();
     Ok(())
 }

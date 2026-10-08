@@ -41,6 +41,7 @@ export component MainWindow inherits Window {
     in property <int> direct-shell-index;
     in property <bool> paused;
     in property <string> logs-rule-name;
+    in-out property <string> notice;
 
     // ---- view state ----
     in-out property <int> active-view: 0; // 0 list, 1 editor, 2 logs, 3 settings
@@ -80,6 +81,7 @@ export component MainWindow inherits Window {
     callback request-run-now(string);
     callback request-toggle-enabled(string, bool);
     callback request-open-logs(string);
+    callback request-select-run(int);
     callback save-rule();
     callback cancel-edit();
     callback request-settings();
@@ -108,6 +110,11 @@ export component MainWindow inherits Window {
                 }
                 Text {
                     text: root.paused ? "· paused" : "";
+                    color: #d08a2c;
+                    vertical-alignment: center;
+                }
+                Text {
+                    text: root.notice;
                     color: #d08a2c;
                     vertical-alignment: center;
                 }
@@ -324,7 +331,7 @@ export component MainWindow inherits Window {
                             height: 56px;
                             background: idx == root.selected-run-index ? #2f2f52 : (rt.has-hover ? #2a2a30 : #232329);
                             border-radius: 6px;
-                            rt := TouchArea { clicked => { root.selected-run-index = idx; } }
+                            rt := TouchArea { clicked => { root.request-select-run(idx); } }
                             VerticalLayout {
                                 padding: 8px;
                                 Text {

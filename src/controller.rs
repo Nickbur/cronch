@@ -1,7 +1,7 @@
 //! Glue between the Slint UI and the core (store + engine).
 
 use crate::autostart;
-use crate::model::{EnvVar, OverlapPolicy, Rule, Schedule, ShellKind};
+use crate::model::{EnvVar, LastStatus, OverlapPolicy, Rule, Schedule, ShellKind};
 use crate::scheduler::EngineHandle;
 use crate::shell::ShellCatalog;
 use crate::storage::Store;
@@ -11,7 +11,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, Vec
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 struct ShellOptions {
@@ -89,10 +89,19 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
             };
             RunRow {
                 id: r.id.to_string().into(),
-                started: r.started_at.with_timezone(&Local).format("%m-%d %H:%M:%S").to_string().into(),
+                started: r
+                    .started_at
+                    .with_timezone(&Local)
+                    .format("%m-%d %H:%M:%S")
+                    .to_string()
+                    .into(),
                 finished: fmt_dt(r.finished_at, "%H:%M:%S").into(),
                 status: status.into(),
-                exit_code: r.exit_code.map(|c| c.to_string()).unwrap_or_else(|| "—".into()).into(),
+                exit_code: r
+                    .exit_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "—".into())
+                    .into(),
                 trigger: r.trigger.clone().into(),
                 stdout: r.stdout.clone().into(),
                 stderr: r.stderr.clone().into(),
@@ -102,13 +111,26 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
         .collect()
 }
 
+/// Cheap identity of a run list: enough to tell whether the logs model must be
+/// rebuilt (a new run appeared, or the newest run just finished).
+fn run_signature(rows: &[RunRow]) -> Option<(usize, String, String)> {
+    rows.first()
+        .map(|r| (rows.len(), r.id.to_string(), r.finished.to_string()))
+}
+
 /// Load the captured output for the currently selected run into the model so
 /// the log view shows it without pulling every row's bodies on each refresh.
 fn fill_selected_run(store: &Store, ui: &MainWindow, model: &Rc<VecModel<RunRow>>) {
     let idx = ui.get_selected_run_index() as usize;
-    let Some(mut row) = model.row_data(idx) else { return };
-    let Ok(id) = row.id.parse::<i64>() else { return };
-    let Ok(Some(full)) = store.get_run(id) else { return };
+    let Some(mut row) = model.row_data(idx) else {
+        return;
+    };
+    let Ok(id) = row.id.parse::<i64>() else {
+        return;
+    };
+    let Ok(Some(full)) = store.get_run(id) else {
+        return;
+    };
     row.stdout = full.stdout.into();
     row.stderr = full.stderr.into();
     model.set_row_data(idx, row);
@@ -234,6 +256,12 @@ pub fn setup(
     ui.set_direct_shell_index(opts.direct_index);
 
     let current_logs_rule: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
+    // Signature of the last rendered run list, so the logs view is only
+    // rebuilt when its content actually changes (avoids wiping the panel and
+    // its selection every second).
+    let runs_signature: Rc<RefCell<Option<(usize, String, String)>>> = Rc::new(RefCell::new(None));
+    // When the header notice should disappear (set when the user clicks "Run now").
+    let notice_until: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
 
     // Persistent model instances: updates happen in place (set_vec), so the UI
     // keeps scroll/selection state instead of being re-bound every second.
@@ -279,8 +307,12 @@ pub fn setup(
         let opts = opts.clone();
         ui.on_request_edit(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
-            let Ok(Some(rule)) = store.get_rule(uuid) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
+            let Ok(Some(rule)) = store.get_rule(uuid) else {
+                return;
+            };
 
             ui.set_edit_id(id);
             ui.set_edit_title("Edit rule".into());
@@ -320,7 +352,10 @@ pub fn setup(
                 Schedule::Once { at } => {
                     ui.set_edit_schedule_mode(2);
                     ui.set_edit_once(
-                        at.with_timezone(&Local).format("%Y-%m-%d %H:%M").to_string().into(),
+                        at.with_timezone(&Local)
+                            .format("%Y-%m-%d %H:%M")
+                            .to_string()
+                            .into(),
                     );
                 }
             }
@@ -437,7 +472,9 @@ pub fn setup(
         let rules_model = rules_model.clone();
         ui.on_request_delete(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
             let confirm = rfd::MessageDialog::new()
                 .set_title("Delete rule")
                 .set_description("Delete this rule and its run history? This cannot be undone.")
@@ -454,11 +491,30 @@ pub fn setup(
 
     // --- Run now ---
     {
+        let weak = ui.as_weak();
+        let store = store.clone();
         let engine = engine.clone();
+        let notice_until = notice_until.clone();
         ui.on_request_run_now(move |id| {
-            if let Ok(uuid) = Uuid::parse_str(id.as_str()) {
-                engine.run_now(uuid);
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
+            // A manual run respects the rule's overlap policy; if it will be
+            // skipped because an instance is already running, say so instead of
+            // silently doing nothing.
+            let notice = match store.get_rule(uuid) {
+                Ok(Some(r))
+                    if r.last_status == LastStatus::Running && r.overlap == OverlapPolicy::Skip =>
+                {
+                    "Already running — this run was skipped"
+                }
+                _ => "Run requested",
+            };
+            engine.run_now(uuid);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_notice(notice.into());
             }
+            *notice_until.borrow_mut() = Some(Instant::now() + Duration::from_secs(4));
         });
     }
 
@@ -471,7 +527,9 @@ pub fn setup(
         let rules_model = rules_model.clone();
         ui.on_request_toggle_enabled(move |id, enabled| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
             let _ = store.set_enabled(uuid, enabled);
             engine.reload_rule(uuid);
             refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
@@ -483,10 +541,13 @@ pub fn setup(
         let weak = ui.as_weak();
         let store = store.clone();
         let current = current_logs_rule.clone();
+        let runs_signature = runs_signature.clone();
         let runs_model = runs_model.clone();
         ui.on_request_open_logs(move |id| {
             let Some(ui) = weak.upgrade() else { return };
-            let Ok(uuid) = Uuid::parse_str(id.as_str()) else { return };
+            let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
+                return;
+            };
             *current.borrow_mut() = Some(uuid);
             let name = store
                 .get_rule(uuid)
@@ -496,9 +557,23 @@ pub fn setup(
                 .unwrap_or_default();
             ui.set_logs_rule_name(name.into());
             ui.set_selected_run_index(0);
-            runs_model.set_vec(build_run_rows(&store, uuid));
+            let rows = build_run_rows(&store, uuid);
+            *runs_signature.borrow_mut() = run_signature(&rows);
+            runs_model.set_vec(rows);
             fill_selected_run(&store, &ui, &runs_model);
             ui.set_active_view(2);
+        });
+    }
+
+    // --- Select a run in the logs view ---
+    {
+        let weak = ui.as_weak();
+        let store = store.clone();
+        let runs_model = runs_model.clone();
+        ui.on_request_select_run(move |idx| {
+            let Some(ui) = weak.upgrade() else { return };
+            ui.set_selected_run_index(idx);
+            fill_selected_run(&store, &ui, &runs_model);
         });
     }
 
@@ -528,16 +603,16 @@ pub fn setup(
         ui.on_save_settings(move || {
             let Some(ui) = weak.upgrade() else { return };
             let want = ui.get_setting_autostart();
-            let (msg, stored) = if want {
+            // The OS login-item is the single source of truth; no DB mirror.
+            let msg = if want {
                 match autostart::enable() {
-                    Ok(_) => ("Saved. Launch at login is on.".to_string(), "1"),
-                    Err(_) => ("Saved, but enabling autostart failed.".to_string(), "0"),
+                    Ok(_) => "Saved. Launch at login is on.".to_string(),
+                    Err(_) => "Saved, but enabling autostart failed.".to_string(),
                 }
             } else {
                 let _ = autostart::disable();
-                ("Saved. Launch at login is off.".to_string(), "0")
+                "Saved. Launch at login is off.".to_string()
             };
-            let _ = store.setting_set("autostart", stored);
             let days = ui.get_setting_retention_days();
             let _ = store.setting_set("history_retention_days", &days.to_string());
             let _ = store.prune_history(days as i64);
@@ -560,7 +635,9 @@ pub fn setup(
                     Ok(rules) => match serde_json::to_vec_pretty(&rules) {
                         Ok(bytes) => {
                             if std::fs::write(&path, bytes).is_ok() {
-                                ui.set_settings_status(format!("Exported {} rules.", rules.len()).into());
+                                ui.set_settings_status(
+                                    format!("Exported {} rules.", rules.len()).into(),
+                                );
                             } else {
                                 ui.set_settings_status("Export failed to write file.".into());
                             }
@@ -582,7 +659,10 @@ pub fn setup(
         let rules_model = rules_model.clone();
         ui.on_import_rules(move || {
             let Some(ui) = weak.upgrade() else { return };
-            if let Some(path) = rfd::FileDialog::new().add_filter("JSON", &["json"]).pick_file() {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("JSON", &["json"])
+                .pick_file()
+            {
                 match std::fs::read(&path) {
                     Ok(bytes) => match serde_json::from_slice::<Vec<Rule>>(&bytes) {
                         Ok(rules) => {
@@ -591,10 +671,7 @@ pub fn setup(
                             for r in &rules {
                                 if let Err(e) = r.validate() {
                                     skipped += 1;
-                                    log::warn!(
-                                        "import skipped invalid rule '{}': {e}",
-                                        r.name
-                                    );
+                                    log::warn!("import skipped invalid rule '{}': {e}", r.name);
                                     continue;
                                 }
                                 if store.upsert_rule(r).is_ok() {
@@ -664,22 +741,42 @@ pub fn setup(
         let current = current_logs_rule.clone();
         let rules_model = rules_model.clone();
         let runs_model = runs_model.clone();
-        timer.start(TimerMode::Repeated, Duration::from_millis(1000), move || {
-            let Some(ui) = weak.upgrade() else { return };
-            let view = ui.get_active_view();
-            if view == 0 {
-                refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
-            } else {
-                // keep the paused indicator fresh everywhere
-                ui.set_paused(engine.is_paused());
-            }
-            if view == 2
-                && let Some(uuid) = *current.borrow()
-            {
-                runs_model.set_vec(build_run_rows(&store, uuid));
-                fill_selected_run(&store, &ui, &runs_model);
-            }
-        });
+        let runs_signature = runs_signature.clone();
+        let notice_until = notice_until.clone();
+        timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(1000),
+            move || {
+                let Some(ui) = weak.upgrade() else { return };
+                // Retire the transient header notice once it has expired.
+                let notice_expired =
+                    matches!(*notice_until.borrow(), Some(until) if Instant::now() >= until);
+                if notice_expired {
+                    ui.set_notice("".into());
+                    *notice_until.borrow_mut() = None;
+                }
+                let view = ui.get_active_view();
+                if view == 0 {
+                    refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+                } else {
+                    // keep the paused indicator fresh everywhere
+                    ui.set_paused(engine.is_paused());
+                }
+                if view == 2
+                    && let Some(uuid) = *current.borrow()
+                {
+                    let rows = build_run_rows(&store, uuid);
+                    let signature = run_signature(&rows);
+                    // Only rebuild when the list actually changed, so the selected
+                    // run's captured output is not wiped every second.
+                    if *runs_signature.borrow() != signature {
+                        *runs_signature.borrow_mut() = signature;
+                        runs_model.set_vec(rows);
+                    }
+                    fill_selected_run(&store, &ui, &runs_model);
+                }
+            },
+        );
     }
     timer
 }

@@ -122,6 +122,17 @@ impl ShellKind {
     }
 }
 
+/// Placeholder in a shell argument template replaced by the rule's command
+/// (as a single argument) at execution time.
+pub const CMD_PLACEHOLDER: &str = "{cmd}";
+
+/// Split an argument template into words exactly the way the executor will, so
+/// validation and execution can never disagree. Shell-like quoting/escaping is
+/// honored; the `{cmd}` placeholder is left in place for the caller to expand.
+pub fn parse_arg_template(template: &str) -> Result<Vec<String>, String> {
+    shell_words::split(template).map_err(|e| format!("Invalid argument template: {e}"))
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum OverlapPolicy {
     Skip,
@@ -261,7 +272,8 @@ impl Rule {
             if path.trim().is_empty() {
                 return Err("Custom shell path must not be empty".into());
             }
-            if !arg_template.contains("{cmd}") {
+            let words = parse_arg_template(arg_template)?;
+            if !words.iter().any(|w| w.contains(CMD_PLACEHOLDER)) {
                 return Err("Custom argument template must contain {cmd}".into());
             }
         }
@@ -303,21 +315,39 @@ mod tests {
     #[test]
     fn once_in_past_is_none() {
         let base = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-        let s = Schedule::Once { at: base - Duration::seconds(10) };
+        let s = Schedule::Once {
+            at: base - Duration::seconds(10),
+        };
         assert_eq!(s.next_after(base), None);
-        let s2 = Schedule::Once { at: base + Duration::seconds(10) };
+        let s2 = Schedule::Once {
+            at: base + Duration::seconds(10),
+        };
         assert_eq!(s2.next_after(base), Some(base + Duration::seconds(10)));
     }
 
     #[test]
     fn cron_validation() {
-        assert!(Schedule::Cron { expr: "0 9 * * *".into() }.validate().is_ok());
-        assert!(Schedule::Cron { expr: "nonsense".into() }.validate().is_err());
+        assert!(
+            Schedule::Cron {
+                expr: "0 9 * * *".into()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            Schedule::Cron {
+                expr: "nonsense".into()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
     fn cron_next_after_is_evaluated_in_local_time() {
-        let s = Schedule::Cron { expr: "0 9 * * *".into() };
+        let s = Schedule::Cron {
+            expr: "0 9 * * *".into(),
+        };
         let next = s.next_after(Utc::now()).expect("cron should fire");
         assert_eq!(
             next.with_timezone(&Local).hour(),
@@ -328,7 +358,12 @@ mod tests {
 
     #[test]
     fn rule_validation() {
-        let mut r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let mut r = Rule::new(
+            "n".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         assert!(r.validate().is_ok());
         r.command = "  ".into();
         assert!(r.validate().is_err());
@@ -336,13 +371,23 @@ mod tests {
 
     #[test]
     fn rule_default_timeout_is_300_seconds() {
-        let r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let r = Rule::new(
+            "n".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         assert_eq!(r.timeout_secs, 300, "new rules must have a default timeout");
     }
 
     #[test]
     fn rule_rejects_negative_timeout() {
-        let mut r = Rule::new("n".into(), "echo hi".into(), ShellKind::Direct, Schedule::Interval { seconds: 5 });
+        let mut r = Rule::new(
+            "n".into(),
+            "echo hi".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
         r.timeout_secs = -1;
         assert!(r.validate().is_err());
     }
