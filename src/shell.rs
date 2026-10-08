@@ -3,6 +3,8 @@
 //! Each detected shell carries an `arg_template` whose `{cmd}` placeholder is
 //! replaced by the rule's command **as a single argument** at execution time.
 
+use crate::envres::BaseEnv;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -27,9 +29,13 @@ impl ShellCatalog {
         self.shells.iter().find(|s| s.key == key)
     }
 
-    pub fn detect() -> ShellCatalog {
+    /// Detect installed shells, searching the PATH of the resolved login
+    /// environment (the one jobs run with) rather than this process's own,
+    /// which can be minimal when Cronch was started at login.
+    pub fn detect(base_env: &BaseEnv) -> ShellCatalog {
+        let path = base_env.get("PATH").map(OsStr::new);
         ShellCatalog {
-            shells: detect_platform(),
+            shells: detect_platform(path),
         }
     }
 }
@@ -50,10 +56,10 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Search PATH for an executable, returning its absolute path.
-fn which(program: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
+/// Search `path_var` (a PATH-style list) for an executable, returning its
+/// absolute path.
+fn which(path_var: Option<&OsStr>, program: &str) -> Option<PathBuf> {
+    for dir in std::env::split_paths(path_var?) {
         let candidate = dir.join(program);
         if is_executable(&candidate) {
             return Some(candidate);
@@ -71,11 +77,12 @@ fn first_existing(paths: &[&str]) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn detect_platform() -> Vec<ShellInfo> {
+fn detect_platform(path: Option<&OsStr>) -> Vec<ShellInfo> {
     let mut out = Vec::new();
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
 
-    // Command Prompt
+    // Command Prompt. `/S` makes cmd strip exactly the outer quotes the
+    // executor wraps the command in, so the command runs verbatim.
     let cmd = std::env::var("ComSpec")
         .ok()
         .map(PathBuf::from)
@@ -86,7 +93,7 @@ fn detect_platform() -> Vec<ShellInfo> {
             key: "cmd".into(),
             label: "Command Prompt (cmd)".into(),
             path: p.to_string_lossy().into_owned(),
-            arg_template: "/C {cmd}".into(),
+            arg_template: "/S /C {cmd}".into(),
         });
     }
 
@@ -94,7 +101,7 @@ fn detect_platform() -> Vec<ShellInfo> {
     if let Some(p) = first_existing(&[&format!(
         "{sysroot}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
     )])
-    .or_else(|| which("powershell.exe"))
+    .or_else(|| which(path, "powershell.exe"))
     {
         out.push(ShellInfo {
             key: "powershell".into(),
@@ -105,7 +112,7 @@ fn detect_platform() -> Vec<ShellInfo> {
     }
 
     // PowerShell 7+
-    if let Some(p) = which("pwsh.exe") {
+    if let Some(p) = which(path, "pwsh.exe") {
         out.push(ShellInfo {
             key: "pwsh".into(),
             label: "PowerShell 7+".into(),
@@ -119,7 +126,7 @@ fn detect_platform() -> Vec<ShellInfo> {
         "C:\\Program Files\\Git\\bin\\bash.exe",
         "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
     ])
-    .or_else(|| which("bash.exe"))
+    .or_else(|| which(path, "bash.exe"))
     {
         out.push(ShellInfo {
             key: "gitbash".into(),
@@ -130,7 +137,7 @@ fn detect_platform() -> Vec<ShellInfo> {
     }
 
     // WSL
-    if let Some(p) = which("wsl.exe") {
+    if let Some(p) = which(path, "wsl.exe") {
         out.push(ShellInfo {
             key: "wsl".into(),
             label: "WSL (bash)".into(),
@@ -143,7 +150,7 @@ fn detect_platform() -> Vec<ShellInfo> {
 }
 
 #[cfg(not(windows))]
-fn detect_platform() -> Vec<ShellInfo> {
+fn detect_platform(path: Option<&OsStr>) -> Vec<ShellInfo> {
     let mut out = Vec::new();
 
     let candidates = [
@@ -151,8 +158,8 @@ fn detect_platform() -> Vec<ShellInfo> {
         ("bash", "Bash", "/bin/bash"),
         ("sh", "sh", "/bin/sh"),
     ];
-    for (key, label, path) in candidates {
-        let resolved = first_existing(&[path]).or_else(|| which(key));
+    for (key, label, default_path) in candidates {
+        let resolved = first_existing(&[default_path]).or_else(|| which(path, key));
         if let Some(p) = resolved {
             out.push(ShellInfo {
                 key: key.into(),
@@ -163,7 +170,7 @@ fn detect_platform() -> Vec<ShellInfo> {
         }
     }
 
-    if let Some(p) = which("fish") {
+    if let Some(p) = which(path, "fish") {
         out.push(ShellInfo {
             key: "fish".into(),
             label: "fish".into(),

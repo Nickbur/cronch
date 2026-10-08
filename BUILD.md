@@ -8,8 +8,15 @@ toolchain + a system linker, get the source, and run one `cargo` command.
 macOS — that runs the tray app.
 
 There is nothing to configure. SQLite is compiled in (no database to install),
-and the app stores its data per-user (`%APPDATA%\burakov\Cronch` on Windows,
+and the app stores its data per-user — the database `cronch.db` and, for release
+builds, its log `cronch.log` (`%APPDATA%\burakov\Cronch\data` on Windows,
 `~/Library/Application Support/net.burakov.Cronch` on macOS).
+
+**Debug builds** (`cargo run`, `npm run serve`) run as a separate app,
+*Cronch-Dev*: their own data folder (`…\burakov\Cronch-Dev\data`,
+`…/net.burakov.Cronch-Dev`), their own single-instance lock, logs printed to the
+terminal, and launch at login is never turned on automatically. So a debug build
+can run next to an installed Cronch without touching its rules or login item.
 
 > The first build compiles the whole dependency tree (Slint, winit, Tokio, …)
 > and takes a few minutes. Every build after that is fast.
@@ -120,9 +127,10 @@ Double-click it in File Explorer, or run it from the terminal:
 .\target\release\cronch.exe
 ```
 
-A window opens and a clock icon appears in the system tray (bottom-right, near
-the clock — you may need to click the "^" to show hidden icons). Closing the
-window hides Cronch to the tray; quit it from the tray menu.
+A window opens and the Cronch icon (a green loop arrow) appears in the system
+tray (bottom-right, near the clock — you may need to click the "^" to show
+hidden icons). Closing the window hides Cronch to the tray; quit it from the
+tray menu. Starting it again while it runs just brings the window back.
 
 ### Windows notes
 
@@ -136,7 +144,8 @@ window hides Cronch to the tray; quit it from the tray menu.
     inside the app.
 - **Debug build:** `cargo build` (without `--release`) is faster to compile,
     produces `target\debug\cronch.exe`, and prints logs to the console — handy if
-    something misbehaves.
+    something misbehaves. It runs as *Cronch-Dev* (see above). A release build
+    has no console; its log is `%APPDATA%\burakov\Cronch\data\cronch.log`.
 
 ---
 
@@ -203,8 +212,10 @@ Run it from the terminal:
 ./target/release/cronch
 ```
 
-The window opens and a clock icon appears in the **menu bar** (top-right).
-Closing the window hides Cronch to the menu bar; quit it from the menu.
+The window opens and the Cronch icon (a green loop arrow) appears in the
+**menu bar** (top-right). Closing the window hides Cronch to the menu bar; quit
+it from the menu. Running the binary again — or clicking its Dock icon — while
+it runs just brings the window back.
 
 ### macOS notes
 
@@ -216,6 +227,8 @@ Closing the window hides Cronch to the menu bar; quit it from the menu.
     friction you'd sign and notarize the app.
 - **Launch at login:** on first run Cronch installs a **LaunchAgent** so it
     starts at login. Turn it off in **Settings** inside the app.
+- **Log:** a release build writes its log to
+    `~/Library/Application Support/net.burakov.Cronch/cronch.log`.
 - **A plain binary, not a `.app`:** `cargo build` produces a Unix executable,
     not a double-clickable `.app` bundle. That's all you need to run it. To make a
     proper `.app`/`.dmg`, see "Distributable packages" below.

@@ -273,8 +273,8 @@ export component MainWindow inherits Window {
                         ComboBox { model: ["seconds", "minutes", "hours", "days"]; current-index <=> root.edit-interval-unit; }
                     }
                     if root.edit-schedule-mode == 1: VerticalLayout {
-                        LineEdit { placeholder-text: "cron, e.g. 0 9 * * *  (min hour dom mon dow)"; text <=> root.edit-cron; }
-                        Text { text: "5-field standard cron (seconds assumed 0), or 6-field with seconds."; color: #777; font-size: 11px; }
+                        LineEdit { placeholder-text: "cron, e.g. 0 9 * * 1-5  (min hour dom mon dow)"; text <=> root.edit-cron; }
+                        Text { text: "Standard 5-field cron (seconds assumed 0; Sunday is 0 or 7), or 6 fields with leading seconds."; color: #777; font-size: 11px; }
                     }
                     if root.edit-schedule-mode == 2: LineEdit { placeholder-text: "YYYY-MM-DD HH:MM (local time)"; text <=> root.edit-once; }
 
@@ -336,7 +336,11 @@ export component MainWindow inherits Window {
                                 padding: 8px;
                                 Text {
                                     text: run.started + "   " + run.status;
-                                    color: run.success ? #43c06a : (run.status == "Running" ? #2dbfa8 : #e05a4a);
+                                    color: run.status == "Success" ? #43c06a
+                                        : run.status == "Failed" ? #e05a4a
+                                        : run.status == "Running" ? #2dbfa8
+                                        : run.status == "TimedOut" || run.status == "Cancelled" ? #d08a2c
+                                        : #a0a0a8;
                                     font-weight: 600;
                                 }
                                 Text { text: "exit " + run.exit-code + "  ·  " + run.trigger; color: #77777f; font-size: 11px; }

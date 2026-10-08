@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS rules (
     next_run       TEXT,
     last_exit_code INTEGER,
     last_status    TEXT NOT NULL,
-    timeout_secs   INTEGER NOT NULL DEFAULT 300
+    timeout_secs   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS runs (
     stdout      TEXT NOT NULL DEFAULT '',
     stderr      TEXT NOT NULL DEFAULT '',
     trigger     TEXT NOT NULL,
+    status      TEXT,
     FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE
 );
 
@@ -61,20 +62,27 @@ fn dt_to_str(dt: &DateTime<Utc>) -> String {
     dt.to_rfc3339()
 }
 
+fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    Ok(conn
+        .prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")?
+        .query_row(params![table, column], |_| Ok(()))
+        .optional()?
+        .is_some())
+}
+
 /// Apply the schema and migrate older databases (add columns added in later
 /// versions, with safe defaults).
 fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(SCHEMA)?;
     // Databases created before the per-rule timeout existed lack this column.
-    let has_timeout: bool = conn
-        .prepare("SELECT 1 FROM pragma_table_info('rules') WHERE name = 'timeout_secs'")?
-        .query_row([], |_| Ok(()))
-        .optional()?
-        .is_some();
-    if !has_timeout {
-        conn.execute_batch(
-            "ALTER TABLE rules ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 300",
-        )?;
+    // Their rules always ran without a limit, so they keep 0 (= no limit).
+    if !has_column(conn, "rules", "timeout_secs")? {
+        conn.execute_batch("ALTER TABLE rules ADD COLUMN timeout_secs INTEGER NOT NULL DEFAULT 0")?;
+    }
+    // Per-run outcome (Success/Failed/TimedOut/Cancelled). Older rows keep
+    // NULL and are shown from their `success` flag.
+    if !has_column(conn, "runs", "status")? {
+        conn.execute_batch("ALTER TABLE runs ADD COLUMN status TEXT")?;
     }
     Ok(())
 }
@@ -296,19 +304,29 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Close a run row with its outcome; `success` is derived from `status`.
     pub fn finish_run(
         &self,
         run_id: i64,
         finished: DateTime<Utc>,
         exit_code: Option<i32>,
-        success: bool,
+        status: LastStatus,
         stdout: &str,
         stderr: &str,
     ) -> Result<()> {
+        let success = status == LastStatus::Success;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE runs SET finished_at=?2, exit_code=?3, success=?4, stdout=?5, stderr=?6 WHERE id=?1",
-            params![run_id, dt_to_str(&finished), exit_code, success as i64, stdout, stderr],
+            "UPDATE runs SET finished_at=?2, exit_code=?3, success=?4, status=?5, stdout=?6, stderr=?7 WHERE id=?1",
+            params![
+                run_id,
+                dt_to_str(&finished),
+                exit_code,
+                success as i64,
+                status.as_str(),
+                stdout,
+                stderr
+            ],
         )?;
         Ok(())
     }
@@ -318,7 +336,7 @@ impl Store {
     pub fn list_runs(&self, rule_id: Uuid, limit: i64) -> Result<Vec<RunRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, started_at, finished_at, exit_code, success, trigger
+            "SELECT id, started_at, finished_at, exit_code, success, trigger, status
              FROM runs WHERE rule_id = ?1 ORDER BY started_at DESC, id DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![rule_id.to_string(), limit], |row| {
@@ -329,17 +347,19 @@ impl Store {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for r in rows {
-            let (id, started, finished, exit, success, trigger) = r?;
+            let (id, started, finished, exit, success, trigger, status) = r?;
             out.push(RunRecord {
                 id,
                 started_at: parse_dt(&started)?,
                 finished_at: parse_opt_dt(finished)?,
                 exit_code: exit.map(|v| v as i32),
                 success: success != 0,
+                status: status.as_deref().map(LastStatus::from_str_lossy),
                 stdout: String::new(),
                 stderr: String::new(),
                 trigger,
@@ -353,7 +373,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let row = conn
             .query_row(
-                "SELECT id, started_at, finished_at, exit_code, success, stdout, stderr, trigger
+                "SELECT id, started_at, finished_at, exit_code, success, stdout, stderr, trigger, status
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 |row| {
@@ -366,18 +386,20 @@ impl Store {
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
                     ))
                 },
             )
             .optional()?;
         match row {
-            Some((id, started, finished, exit, success, stdout, stderr, trigger)) => {
+            Some((id, started, finished, exit, success, stdout, stderr, trigger, status)) => {
                 Ok(Some(RunRecord {
                     id,
                     started_at: parse_dt(&started)?,
                     finished_at: parse_opt_dt(finished)?,
                     exit_code: exit.map(|v| v as i32),
                     success: success != 0,
+                    status: status.as_deref().map(LastStatus::from_str_lossy),
                     stdout,
                     stderr,
                     trigger,
@@ -393,7 +415,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let note = "\ncronch: interrupted by shutdown or restart";
         let n = conn.execute(
-            "UPDATE runs SET finished_at = ?1, success = 0, stderr = stderr || ?2
+            "UPDATE runs SET finished_at = ?1, success = 0, status = 'Cancelled', stderr = stderr || ?2
              WHERE finished_at IS NULL",
             params![dt_to_str(&Utc::now()), note],
         )?;
@@ -459,7 +481,11 @@ mod tests {
         assert_eq!(got.name, "my rule");
         assert_eq!(got.command, "echo hi");
         assert!(matches!(got.schedule, Schedule::Interval { seconds: 5 }));
-        assert_eq!(got.timeout_secs, 300, "timeout must round-trip");
+        assert_eq!(
+            got.timeout_secs,
+            crate::model::default_timeout_secs(),
+            "timeout must round-trip"
+        );
         assert_eq!(store.list_rules().unwrap().len(), 1);
         store.delete_rule(rule.id).unwrap();
         assert_eq!(store.list_rules().unwrap().len(), 0);
@@ -503,7 +529,39 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(timeout, 300, "migrated rows must get the default timeout");
+        assert_eq!(
+            timeout, 0,
+            "rules from before timeouts existed must keep running without a limit"
+        );
+    }
+
+    #[test]
+    fn migrates_old_runs_table_adding_status_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Simulate a database created before per-run outcomes were recorded.
+        conn.execute_batch(
+            "CREATE TABLE runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_id     TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT,
+                exit_code   INTEGER,
+                success     INTEGER NOT NULL DEFAULT 0,
+                stdout      TEXT NOT NULL DEFAULT '',
+                stderr      TEXT NOT NULL DEFAULT '',
+                trigger     TEXT NOT NULL
+            );
+            INSERT INTO runs (rule_id, started_at, finished_at, success, trigger)
+            VALUES ('x', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:01+00:00', 1, 'manual');",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let status: Option<String> = conn
+            .query_row("SELECT status FROM runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, None, "old rows keep a NULL status");
     }
 
     #[test]
@@ -519,15 +577,35 @@ mod tests {
         let started = Utc::now();
         let run_id = store.begin_run(rule.id, started, "manual").unwrap();
         store
-            .finish_run(run_id, Utc::now(), Some(0), true, "out", "")
+            .finish_run(run_id, Utc::now(), Some(0), LastStatus::Success, "out", "")
             .unwrap();
         let runs = store.list_runs(rule.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, run_id);
         assert!(runs[0].success);
+        assert_eq!(runs[0].status, Some(LastStatus::Success));
         assert_eq!(runs[0].stdout, "", "list_runs must not carry output bodies");
         let full = store.get_run(run_id).unwrap().unwrap();
         assert_eq!(full.stdout, "out", "full record must carry captured output");
+    }
+
+    #[test]
+    fn run_outcome_is_recorded_per_run() {
+        let store = Store::open_in_memory().unwrap();
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        store.upsert_rule(&rule).unwrap();
+        let run_id = store.begin_run(rule.id, Utc::now(), "schedule").unwrap();
+        store
+            .finish_run(run_id, Utc::now(), None, LastStatus::TimedOut, "", "killed")
+            .unwrap();
+        let run = store.get_run(run_id).unwrap().unwrap();
+        assert_eq!(run.status, Some(LastStatus::TimedOut));
+        assert!(!run.success, "a timed-out run is not a success");
     }
 
     #[test]
@@ -549,6 +627,7 @@ mod tests {
         let run = store.get_run(run_id).unwrap().unwrap();
         assert!(run.finished_at.is_some(), "orphan run must be closed");
         assert!(!run.success);
+        assert_eq!(run.status, Some(LastStatus::Cancelled));
         assert!(run.stderr.contains("interrupted"));
 
         let got = store.get_rule(rule.id).unwrap().unwrap();
@@ -573,7 +652,7 @@ mod tests {
         // A finished run and a still-open run, both started long ago.
         let done = store.begin_run(rule.id, Utc::now(), "manual").unwrap();
         store
-            .finish_run(done, Utc::now(), Some(0), true, "", "")
+            .finish_run(done, Utc::now(), Some(0), LastStatus::Success, "", "")
             .unwrap();
         let running = store.begin_run(rule.id, Utc::now(), "manual").unwrap();
         {

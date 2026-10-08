@@ -28,7 +28,7 @@ panic = "abort"
 anyhow = "1.0.104"
 auto-launch = "0.6.0"
 chrono = { version = "0.4.45", features = ["serde"] }
-cron = "0.17.0"
+croner = "4.0.1"
 directories = "6.0.0"
 env_logger = "0.11.11"
 image = "0.25.10"
@@ -54,3 +54,7 @@ winresource = "0.1"
 # Unix-only: kill a job's whole process group on timeout.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# macOS-only: answers the "reopen" Apple event (Dock icon, opening the app again).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"

@@ -1,7 +1,9 @@
 //! Glue between the Slint UI and the core (store + engine).
 
 use crate::autostart;
-use crate::model::{EnvVar, LastStatus, OverlapPolicy, Rule, Schedule, ShellKind};
+use crate::model::{
+    EnvVar, LastStatus, MAX_TIMEOUT_SECS, OverlapPolicy, Rule, Schedule, ShellKind,
+};
 use crate::scheduler::EngineHandle;
 use crate::shell::ShellCatalog;
 use crate::storage::Store;
@@ -14,6 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Date/time format of the editor's "Once" field (local time).
+const ONCE_FORMAT: &str = "%Y-%m-%d %H:%M";
+
 struct ShellOptions {
     labels: Vec<SharedString>,
     keys: Vec<String>,
@@ -21,12 +26,19 @@ struct ShellOptions {
     direct_index: i32,
 }
 
-fn shell_options(catalog: &ShellCatalog) -> ShellOptions {
+/// The editor's shell choices: detected shells, then (when editing a rule
+/// whose shell is not on this machine) that shell so saving keeps it, then
+/// Custom and Direct.
+fn shell_options(catalog: &ShellCatalog, missing: Option<&str>) -> ShellOptions {
     let mut labels: Vec<SharedString> = Vec::new();
     let mut keys: Vec<String> = Vec::new();
     for s in &catalog.shells {
         labels.push(s.label.clone().into());
         keys.push(s.key.clone());
+    }
+    if let Some(key) = missing {
+        labels.push(format!("{key} (not found on this machine)").into());
+        keys.push(key.to_string());
     }
     let custom_index = labels.len() as i32;
     labels.push("Custom…".into());
@@ -38,6 +50,12 @@ fn shell_options(catalog: &ShellCatalog) -> ShellOptions {
         custom_index,
         direct_index,
     }
+}
+
+fn apply_shell_options(ui: &MainWindow, opts: &ShellOptions) {
+    ui.set_shell_options(ModelRc::new(VecModel::from(opts.labels.clone())));
+    ui.set_custom_shell_index(opts.custom_index);
+    ui.set_direct_shell_index(opts.direct_index);
 }
 
 fn fmt_dt(dt: Option<DateTime<Utc>>, fmt: &str) -> String {
@@ -80,12 +98,12 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
         .unwrap_or_default()
         .into_iter()
         .map(|r| {
-            let status = if r.finished_at.is_none() {
-                "Running"
-            } else if r.success {
-                "Success"
-            } else {
-                "Failed"
+            let status = match (r.finished_at, r.status) {
+                (None, _) => "Running",
+                (Some(_), Some(s)) => s.as_str(),
+                // Runs recorded before outcomes were stored.
+                (Some(_), None) if r.success => "Success",
+                (Some(_), None) => "Failed",
             };
             RunRow {
                 id: r.id.to_string().into(),
@@ -148,6 +166,20 @@ fn rule_signature(rows: &[RuleRow]) -> u64 {
         r.shell_missing.hash(&mut h);
     }
     h.finish()
+}
+
+/// Point the selection back at the selected run after the list was rebuilt
+/// (new runs are inserted at the top, so a fixed index would drift onto a
+/// different run). Falls back to the newest run if the selected one is gone.
+fn reselect_run(ui: &MainWindow, model: &Rc<VecModel<RunRow>>, selected: &RefCell<Option<i64>>) {
+    let wanted = selected.borrow().map(|id| id.to_string());
+    let idx = wanted
+        .and_then(|id| {
+            (0..model.row_count()).find(|&i| model.row_data(i).is_some_and(|r| r.id == id))
+        })
+        .unwrap_or(0);
+    *selected.borrow_mut() = model.row_data(idx).and_then(|r| r.id.parse().ok());
+    ui.set_selected_run_index(idx as i32);
 }
 
 /// Load the captured output for the currently selected run into the model so
@@ -233,7 +265,7 @@ fn build_schedule(ui: &MainWindow) -> Result<Schedule, String> {
         }
         2 => {
             let raw = ui.get_edit_once().to_string();
-            let naive = NaiveDateTime::parse_from_str(raw.trim(), "%Y-%m-%d %H:%M")
+            let naive = NaiveDateTime::parse_from_str(raw.trim(), ONCE_FORMAT)
                 .map_err(|_| "Once time must be in the form YYYY-MM-DD HH:MM".to_string())?;
             let local = Local
                 .from_local_datetime(&naive)
@@ -290,12 +322,13 @@ pub fn setup(
     engine: EngineHandle,
     catalog: Arc<ShellCatalog>,
 ) -> Timer {
-    let opts = Rc::new(shell_options(&catalog));
-    ui.set_shell_options(ModelRc::new(VecModel::from(opts.labels.clone())));
-    ui.set_custom_shell_index(opts.custom_index);
-    ui.set_direct_shell_index(opts.direct_index);
+    // Rebuilt per editor session (see `shell_options`).
+    let opts = Rc::new(RefCell::new(shell_options(&catalog, None)));
+    apply_shell_options(ui, &opts.borrow());
 
     let current_logs_rule: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
+    // The run whose output the logs view shows, tracked by id (see `reselect_run`).
+    let selected_run: Rc<RefCell<Option<i64>>> = Rc::new(RefCell::new(None));
     // Content fingerprints of the last rendered lists, so a view is only
     // rebuilt when its rows actually change (avoids wiping scroll/selection and
     // the selected run's output every second).
@@ -323,8 +356,12 @@ pub fn setup(
     // --- Add ---
     {
         let weak = ui.as_weak();
+        let catalog = catalog.clone();
+        let opts = opts.clone();
         ui.on_request_add(move || {
             let Some(ui) = weak.upgrade() else { return };
+            *opts.borrow_mut() = shell_options(&catalog, None);
+            apply_shell_options(&ui, &opts.borrow());
             ui.set_edit_id("".into());
             ui.set_edit_title("New rule".into());
             ui.set_edit_name("".into());
@@ -352,6 +389,7 @@ pub fn setup(
     {
         let weak = ui.as_weak();
         let store = store.clone();
+        let catalog = catalog.clone();
         let opts = opts.clone();
         ui.on_request_edit(move |id| {
             let Some(ui) = weak.upgrade() else { return };
@@ -361,6 +399,16 @@ pub fn setup(
             let Ok(Some(rule)) = store.get_rule(uuid) else {
                 return;
             };
+
+            // A shell that is not installed here stays selectable, so saving
+            // an unrelated change never switches the rule to another shell.
+            let missing = match &rule.shell {
+                ShellKind::Detected { key } if catalog.get(key).is_none() => Some(key.as_str()),
+                _ => None,
+            };
+            *opts.borrow_mut() = shell_options(&catalog, missing);
+            let opts = opts.borrow();
+            apply_shell_options(&ui, &opts);
 
             ui.set_edit_id(id);
             ui.set_edit_title("Edit rule".into());
@@ -401,7 +449,7 @@ pub fn setup(
                     ui.set_edit_schedule_mode(2);
                     ui.set_edit_once(
                         at.with_timezone(&Local)
-                            .format("%Y-%m-%d %H:%M")
+                            .format(ONCE_FORMAT)
                             .to_string()
                             .into(),
                     );
@@ -415,7 +463,7 @@ pub fn setup(
             });
             ui.set_edit_working_dir(rule.working_dir.clone().unwrap_or_default().into());
             ui.set_edit_env(env_to_text(&rule.env).into());
-            ui.set_edit_timeout(rule.timeout_secs.clamp(0, 604_800) as i32);
+            ui.set_edit_timeout(rule.timeout_secs.clamp(0, MAX_TIMEOUT_SECS) as i32);
             ui.set_edit_error("".into());
             ui.set_active_view(1);
         });
@@ -432,7 +480,7 @@ pub fn setup(
         let rules_signature = rules_signature.clone();
         ui.on_save_rule(move || {
             let Some(ui) = weak.upgrade() else { return };
-            let shell = match build_shell(&ui, &opts) {
+            let shell = match build_shell(&ui, &opts.borrow()) {
                 Ok(s) => s,
                 Err(e) => {
                     ui.set_edit_error(e.into());
@@ -447,28 +495,35 @@ pub fn setup(
                 }
             };
 
-            let id_str = ui.get_edit_id().to_string();
-            let mut rule = if id_str.is_empty() {
+            let existing = Uuid::parse_str(ui.get_edit_id().as_str())
+                .ok()
+                .and_then(|u| store.get_rule(u).ok().flatten());
+
+            // A one-time run must be in the future, unless it is the unchanged
+            // time of an existing rule (e.g. renaming one that already ran);
+            // that keeps its stored time exactly.
+            let schedule = match (&schedule, existing.as_ref().map(|r| &r.schedule)) {
+                (Schedule::Once { at }, Some(old @ Schedule::Once { at: old_at }))
+                    if at.with_timezone(&Local).format(ONCE_FORMAT).to_string()
+                        == old_at.with_timezone(&Local).format(ONCE_FORMAT).to_string() =>
+                {
+                    old.clone()
+                }
+                (Schedule::Once { at }, _) if *at <= Utc::now() => {
+                    ui.set_edit_error("Once time must be in the future".into());
+                    return;
+                }
+                _ => schedule,
+            };
+
+            let mut rule = existing.unwrap_or_else(|| {
                 Rule::new(
                     String::new(),
                     String::new(),
                     ShellKind::Direct,
                     Schedule::Interval { seconds: 1 },
                 )
-            } else {
-                match Uuid::parse_str(&id_str)
-                    .ok()
-                    .and_then(|u| store.get_rule(u).ok().flatten())
-                {
-                    Some(r) => r,
-                    None => Rule::new(
-                        String::new(),
-                        String::new(),
-                        ShellKind::Direct,
-                        Schedule::Interval { seconds: 1 },
-                    ),
-                }
-            };
+            });
 
             rule.name = ui.get_edit_name().to_string();
             rule.enabled = ui.get_edit_enabled();
@@ -614,6 +669,7 @@ pub fn setup(
         let weak = ui.as_weak();
         let store = store.clone();
         let current = current_logs_rule.clone();
+        let selected_run = selected_run.clone();
         let runs_signature = runs_signature.clone();
         let runs_model = runs_model.clone();
         ui.on_request_open_logs(move |id| {
@@ -629,10 +685,12 @@ pub fn setup(
                 .map(|r| r.name)
                 .unwrap_or_default();
             ui.set_logs_rule_name(name.into());
-            ui.set_selected_run_index(0);
             let rows = build_run_rows(&store, uuid);
             *runs_signature.borrow_mut() = Some(run_signature(&rows));
             runs_model.set_vec(rows);
+            // Start on the newest run.
+            *selected_run.borrow_mut() = None;
+            reselect_run(&ui, &runs_model, &selected_run);
             fill_selected_run(&store, &ui, &runs_model);
             ui.set_active_view(2);
         });
@@ -642,10 +700,14 @@ pub fn setup(
     {
         let weak = ui.as_weak();
         let store = store.clone();
+        let selected_run = selected_run.clone();
         let runs_model = runs_model.clone();
         ui.on_request_select_run(move |idx| {
             let Some(ui) = weak.upgrade() else { return };
             ui.set_selected_run_index(idx);
+            *selected_run.borrow_mut() = runs_model
+                .row_data(idx as usize)
+                .and_then(|r| r.id.parse().ok());
             fill_selected_run(&store, &ui, &runs_model);
         });
     }
@@ -741,15 +803,35 @@ pub fn setup(
                     Ok(bytes) => match serde_json::from_slice::<Vec<Rule>>(&bytes) {
                         Ok(rules) => {
                             let mut imported = 0usize;
+                            let mut copies = 0usize;
                             let mut skipped = 0usize;
-                            for r in &rules {
+                            for mut r in rules {
                                 if let Err(e) = r.validate() {
                                     skipped += 1;
                                     log::warn!("import skipped invalid rule '{}': {e}", r.name);
                                     continue;
                                 }
-                                if store.upsert_rule(r).is_ok() {
+                                // Imported rules start fresh: how they ran on
+                                // another machine (or before a backup) does
+                                // not apply here.
+                                r.last_run = None;
+                                r.next_run = None;
+                                r.last_exit_code = None;
+                                r.last_status = LastStatus::Never;
+                                // Never overwrite an existing rule: one with the
+                                // same id is added as a copy. If the lookup
+                                // fails, copying is the safe choice.
+                                let exists =
+                                    store.get_rule(r.id).map(|o| o.is_some()).unwrap_or(true);
+                                if exists {
+                                    r.id = Uuid::new_v4();
+                                    r.name = format!("{} (copy)", r.name);
+                                }
+                                if store.upsert_rule(&r).is_ok() {
                                     imported += 1;
+                                    if exists {
+                                        copies += 1;
+                                    }
                                 } else {
                                     skipped += 1;
                                 }
@@ -763,10 +845,17 @@ pub fn setup(
                                 &rules_model,
                                 &rules_signature,
                             );
-                            let msg = if skipped > 0 {
-                                format!("Imported {imported} rules ({skipped} invalid skipped).")
-                            } else {
+                            let mut notes = Vec::new();
+                            if copies > 0 {
+                                notes.push(format!("{copies} already existed, added as copies"));
+                            }
+                            if skipped > 0 {
+                                notes.push(format!("{skipped} invalid skipped"));
+                            }
+                            let msg = if notes.is_empty() {
                                 format!("Imported {imported} rules.")
+                            } else {
+                                format!("Imported {imported} rules ({}).", notes.join("; "))
                             };
                             ui.set_settings_status(msg.into());
                         }
@@ -820,6 +909,7 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let current = current_logs_rule.clone();
+        let selected_run = selected_run.clone();
         let rules_model = rules_model.clone();
         let rules_signature = rules_signature.clone();
         let runs_model = runs_model.clone();
@@ -856,13 +946,15 @@ pub fn setup(
                 {
                     let rows = build_run_rows(&store, uuid);
                     let signature = run_signature(&rows);
-                    // Only rebuild when the list actually changed, so the selected
-                    // run's captured output is not wiped every second.
+                    // Only rebuild when the list actually changed (a run started
+                    // or finished), so the selected run's output is not reloaded
+                    // every second; after a rebuild the selection follows its run.
                     if *runs_signature.borrow() != Some(signature) {
                         *runs_signature.borrow_mut() = Some(signature);
                         runs_model.set_vec(rows);
+                        reselect_run(&ui, &runs_model, &selected_run);
+                        fill_selected_run(&store, &ui, &runs_model);
                     }
-                    fill_selected_run(&store, &ui, &runs_model);
                 }
             },
         );
