@@ -398,7 +398,7 @@ impl Store {
             params![dt_to_str(&Utc::now()), note],
         )?;
         conn.execute(
-            "UPDATE rules SET last_status = 'Never' WHERE last_status = 'Running'",
+            "UPDATE rules SET last_status = 'Cancelled' WHERE last_status = 'Running'",
             [],
         )?;
         Ok(n)
@@ -412,7 +412,7 @@ impl Store {
         let cutoff = Utc::now() - chrono::Duration::days(days);
         let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "DELETE FROM runs WHERE started_at < ?1",
+            "DELETE FROM runs WHERE started_at < ?1 AND finished_at IS NOT NULL",
             params![dt_to_str(&cutoff)],
         )?;
         Ok(n)
@@ -554,8 +554,44 @@ mod tests {
         let got = store.get_rule(rule.id).unwrap().unwrap();
         assert_eq!(
             got.last_status,
-            LastStatus::Never,
-            "stale Running status must reset"
+            LastStatus::Cancelled,
+            "stale Running status must reset to Cancelled"
+        );
+    }
+
+    #[test]
+    fn prune_keeps_running_runs() {
+        let store = Store::open_in_memory().unwrap();
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        store.upsert_rule(&rule).unwrap();
+
+        // A finished run and a still-open run, both started long ago.
+        let done = store.begin_run(rule.id, Utc::now(), "manual").unwrap();
+        store
+            .finish_run(done, Utc::now(), Some(0), true, "", "")
+            .unwrap();
+        let running = store.begin_run(rule.id, Utc::now(), "manual").unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            let old = (Utc::now() - chrono::Duration::days(10)).to_rfc3339();
+            conn.execute("UPDATE runs SET started_at = ?1", params![old])
+                .unwrap();
+        }
+
+        let n = store.prune_history(5).unwrap();
+        assert_eq!(n, 1, "only the finished run may be pruned");
+        assert!(
+            store.get_run(done).unwrap().is_none(),
+            "finished run must be pruned"
+        );
+        assert!(
+            store.get_run(running).unwrap().is_some(),
+            "an in-flight run must never be pruned"
         );
     }
 

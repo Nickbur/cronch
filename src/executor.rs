@@ -17,6 +17,8 @@ pub struct Outcome {
     pub stderr: String,
     /// True when the run was killed by the rule's timeout.
     pub timed_out: bool,
+    /// True when the run was cancelled because the app is shutting down.
+    pub cancelled: bool,
 }
 
 impl Outcome {
@@ -27,6 +29,18 @@ impl Outcome {
             stdout: String::new(),
             stderr: format!("cronch: {msg}"),
             timed_out: false,
+            cancelled: false,
+        }
+    }
+
+    fn cancelled() -> Outcome {
+        Outcome {
+            exit_code: None,
+            success: false,
+            stdout: String::new(),
+            stderr: "cronch: cancelled (app is shutting down)".to_string(),
+            timed_out: false,
+            cancelled: true,
         }
     }
 }
@@ -177,13 +191,15 @@ async fn kill_group(pid: Option<u32>) {
 async fn kill_group(pid: Option<u32>) {
     if let Some(pid) = pid {
         // taskkill /T kills the process tree (Windows has no POSIX groups).
-        let _ = tokio::process::Command::new("taskkill")
-            .arg("/PID")
+        // CREATE_NO_WINDOW so killing a job never flashes a console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut cmd = tokio::process::Command::new("taskkill");
+        cmd.arg("/PID")
             .arg(pid.to_string())
             .arg("/T")
             .arg("/F")
-            .status()
-            .await;
+            .creation_flags(CREATE_NO_WINDOW);
+        let _ = cmd.status().await;
     }
 }
 
@@ -225,6 +241,13 @@ pub async fn execute(
     base_env: &BaseEnv,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Outcome {
+    // A shutdown broadcast may already have happened before this job
+    // subscribed; in that case `changed()` would never fire, so detect it up
+    // front and never start the process at all.
+    if *shutdown.borrow() {
+        return Outcome::cancelled();
+    }
+
     let mut cmd = match build_command(rule, catalog, base_env) {
         Ok(c) => c,
         Err(e) => return Outcome::error(e),
@@ -296,6 +319,7 @@ pub async fn execute(
                 stdout,
                 stderr,
                 timed_out: false,
+                cancelled: false,
             },
             Err(e) => Outcome::error(format!("process error: {e}")),
         },
@@ -316,6 +340,7 @@ pub async fn execute(
                 stdout,
                 stderr,
                 timed_out: true,
+                cancelled: false,
             }
         }
         RunResult::Cancelled { stdout, stderr } => {
@@ -331,6 +356,7 @@ pub async fn execute(
                 stdout,
                 stderr,
                 timed_out: false,
+                cancelled: true,
             }
         }
     }
@@ -462,6 +488,32 @@ mod tests {
             .unwrap();
         assert!(!out.success);
         assert!(!out.timed_out);
+        assert!(out.stderr.contains("cancelled"), "stderr: {}", out.stderr);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_signalled_before_subscribe_cancels_new_job() {
+        // Reproduces the race: the receiver is created AFTER shutdown was
+        // broadcast, so `changed()` would never fire. The up-front value check
+        // must catch this and cancel immediately.
+        let rule = Rule::new(
+            "t".into(),
+            "sh -c 'sleep 60'".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 60 },
+        );
+        let (tx, _rx) = tokio::sync::watch::channel(false);
+        tx.send_replace(true);
+        let late_rx = tx.subscribe();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            execute(&rule, &ShellCatalog::detect(), &BaseEnv::resolve(), late_rx),
+        )
+        .await
+        .expect("an already-signalled shutdown must cancel immediately");
+        assert!(out.cancelled, "outcome must be marked cancelled");
+        assert!(!out.success);
         assert!(out.stderr.contains("cancelled"), "stderr: {}", out.stderr);
     }
 }

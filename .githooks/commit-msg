@@ -1,2 +1,0 @@
-#!/bin/sh
-sh .githooks/conventional-commit.sh "$1"

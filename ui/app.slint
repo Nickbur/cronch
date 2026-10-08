@@ -197,7 +197,7 @@ export component MainWindow inherits Window {
                                     color: row.status == "Success" ? #43c06a
                                         : row.status == "Failed" ? #e05a4a
                                         : row.status == "Running" ? #2dbfa8
-                                        : row.status == "TimedOut" ? #d08a2c
+                                        : row.status == "TimedOut" || row.status == "Cancelled" ? #d08a2c
                                         : #a0a0a8;
                                     font-size: 13px;
                                     font-weight: 600;

@@ -42,11 +42,11 @@ npm run build           # full check: clippy -D warnings + release tests + relea
 npm run re-install-npm  # clean rebuild (cargo clean && cargo build)
 ```
 
-The repo ships Git hooks (`.githooks/`) that reject accidental files and enforce
-Conventional Commit messages. Wire them once per clone:
+The repo ships Git hooks (`.husky/`) that reject accidental files and enforce
+Conventional Commit messages. `npm install` (Node 24.16+) wires them once per clone:
 
 ```bash
-npm run prepare   # or: git config core.hooksPath .githooks
+npm install   # installs husky; its prepare step activates the hooks
 ```
 
 ---

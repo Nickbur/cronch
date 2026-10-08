@@ -167,6 +167,9 @@ pub enum LastStatus {
     Skipped,
     Expired,
     TimedOut,
+    /// The run did not complete because the app shut down (graceful quit or a
+    /// crash that left the run open).
+    Cancelled,
 }
 
 impl LastStatus {
@@ -179,6 +182,7 @@ impl LastStatus {
             LastStatus::Skipped => "Skipped",
             LastStatus::Expired => "Expired",
             LastStatus::TimedOut => "TimedOut",
+            LastStatus::Cancelled => "Cancelled",
         }
     }
     pub fn from_str_lossy(s: &str) -> Self {
@@ -189,6 +193,7 @@ impl LastStatus {
             "Skipped" => LastStatus::Skipped,
             "Expired" => LastStatus::Expired,
             "TimedOut" => LastStatus::TimedOut,
+            "Cancelled" => LastStatus::Cancelled,
             _ => LastStatus::Never,
         }
     }
@@ -396,6 +401,11 @@ mod tests {
     fn last_status_timed_out_roundtrips() {
         assert_eq!(LastStatus::TimedOut.as_str(), "TimedOut");
         assert_eq!(LastStatus::from_str_lossy("TimedOut"), LastStatus::TimedOut);
+        assert_eq!(LastStatus::Cancelled.as_str(), "Cancelled");
+        assert_eq!(
+            LastStatus::from_str_lossy("Cancelled"),
+            LastStatus::Cancelled
+        );
         assert_eq!(LastStatus::from_str_lossy("unknown"), LastStatus::Never);
     }
 }

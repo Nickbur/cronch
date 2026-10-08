@@ -113,7 +113,11 @@ impl Engine {
         let id = rule.id;
         // Honor the per-rule "Catch up if missed" toggle: engine catch-up (used
         // on startup and on resume) applies only when the rule itself opts in.
-        let catch_up = catch_up && rule.catch_up;
+        // Never catch up a rule that already has a run in flight: the missed
+        // occurrences are moot, and an immediate fire would only collide with
+        // (and momentarily mislabel) the run that is already going.
+        let busy = self.running.get(&id).copied().unwrap_or(0) > 0;
+        let catch_up = catch_up && rule.catch_up && !busy;
         if !rule.enabled {
             self.armed.remove(&id);
             self.rules.insert(id, rule);
@@ -304,7 +308,9 @@ impl Engine {
             outcome,
             finished,
         } = done;
-        let status = if outcome.timed_out {
+        let status = if outcome.cancelled {
+            LastStatus::Cancelled
+        } else if outcome.timed_out {
             LastStatus::TimedOut
         } else if outcome.success {
             LastStatus::Success
@@ -628,6 +634,60 @@ mod tests {
             "run row must be closed on shutdown"
         );
         assert!(!runs[0].success, "cancelled run must not be a success");
+        let got = store.get_rule(rule.id).unwrap().unwrap();
+        assert_eq!(
+            got.last_status,
+            LastStatus::Cancelled,
+            "a cancelled run must mark the rule Cancelled, not Failed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn resume_does_not_catch_up_a_busy_rule() {
+        let store = Store::open_in_memory().unwrap();
+        #[cfg(windows)]
+        let cmd = "cmd /C \"ping -n 60 127.0.0.1 >NUL\"";
+        #[cfg(not(windows))]
+        let cmd = "sh -c 'sleep 60'";
+        let mut rule = Rule::new(
+            "t".into(),
+            cmd.into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 1 },
+        );
+        rule.timeout_secs = 0;
+        rule.overlap = OverlapPolicy::Parallel;
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, fut) = create(
+            store.clone(),
+            Arc::new(ShellCatalog::detect()),
+            Arc::new(BaseEnv::resolve()),
+        );
+        let jh = tokio::spawn(fut);
+        // Manual run only: the rule is not armed, so nothing fires on a timer.
+        handle.run_now(rule.id);
+        let mut waited = StdDuration::ZERO;
+        while store.list_runs(rule.id, 10).unwrap().is_empty() {
+            assert!(waited < StdDuration::from_secs(5), "run never started");
+            tokio::time::sleep(StdDuration::from_millis(50)).await;
+            waited += StdDuration::from_millis(50);
+        }
+        // Let the 1s interval elapse so a catch-up would be due.
+        tokio::time::sleep(StdDuration::from_millis(1500)).await;
+
+        // Resume triggers a catch-up reload; because a run is in flight it must
+        // be suppressed, so no second (Parallel) run starts.
+        handle.resume_all();
+        tokio::time::sleep(StdDuration::from_millis(500)).await;
+        assert_eq!(
+            store.list_runs(rule.id, 10).unwrap().len(),
+            1,
+            "a busy rule must not catch up on resume"
+        );
+
+        handle.shutdown();
+        let _ = tokio::time::timeout(StdDuration::from_secs(10), jh).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

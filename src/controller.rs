@@ -111,11 +111,43 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
         .collect()
 }
 
-/// Cheap identity of a run list: enough to tell whether the logs model must be
-/// rebuilt (a new run appeared, or the newest run just finished).
-fn run_signature(rows: &[RunRow]) -> Option<(usize, String, String)> {
-    rows.first()
-        .map(|r| (rows.len(), r.id.to_string(), r.finished.to_string()))
+/// Content fingerprint of a run list, so the logs model is only rebuilt when
+/// its rows actually change. Hashing every row (not just the newest) means a
+/// `Parallel` run finishing out of order still triggers a redraw.
+fn run_signature(rows: &[RunRow]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    rows.len().hash(&mut h);
+    for r in rows {
+        r.id.as_str().hash(&mut h);
+        r.started.as_str().hash(&mut h);
+        r.finished.as_str().hash(&mut h);
+        r.status.as_str().hash(&mut h);
+        r.exit_code.as_str().hash(&mut h);
+        r.success.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Content fingerprint of the rule list (same rationale as [`run_signature`]).
+fn rule_signature(rows: &[RuleRow]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    rows.len().hash(&mut h);
+    for r in rows {
+        r.id.as_str().hash(&mut h);
+        r.name.as_str().hash(&mut h);
+        r.schedule.as_str().hash(&mut h);
+        r.shell.as_str().hash(&mut h);
+        r.status.as_str().hash(&mut h);
+        r.last_run.as_str().hash(&mut h);
+        r.next_run.as_str().hash(&mut h);
+        r.enabled.hash(&mut h);
+        r.shell_missing.hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Load the captured output for the currently selected run into the model so
@@ -238,8 +270,16 @@ fn refresh_rules(
     catalog: &ShellCatalog,
     engine: &EngineHandle,
     rules_model: &Rc<VecModel<RuleRow>>,
+    rules_signature: &Rc<RefCell<Option<u64>>>,
 ) {
-    rules_model.set_vec(build_rule_rows(store, catalog));
+    let rows = build_rule_rows(store, catalog);
+    let signature = rule_signature(&rows);
+    // Only rebuild when the content changed, so a long list keeps its scroll
+    // position and hover state instead of being replaced every second.
+    if *rules_signature.borrow() != Some(signature) {
+        *rules_signature.borrow_mut() = Some(signature);
+        rules_model.set_vec(rows);
+    }
     ui.set_paused(engine.is_paused());
 }
 
@@ -256,10 +296,11 @@ pub fn setup(
     ui.set_direct_shell_index(opts.direct_index);
 
     let current_logs_rule: Rc<RefCell<Option<Uuid>>> = Rc::new(RefCell::new(None));
-    // Signature of the last rendered run list, so the logs view is only
-    // rebuilt when its content actually changes (avoids wiping the panel and
-    // its selection every second).
-    let runs_signature: Rc<RefCell<Option<(usize, String, String)>>> = Rc::new(RefCell::new(None));
+    // Content fingerprints of the last rendered lists, so a view is only
+    // rebuilt when its rows actually change (avoids wiping scroll/selection and
+    // the selected run's output every second).
+    let rules_signature: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
+    let runs_signature: Rc<RefCell<Option<u64>>> = Rc::new(RefCell::new(None));
     // When the header notice should disappear (set when the user clicks "Run now").
     let notice_until: Rc<RefCell<Option<Instant>>> = Rc::new(RefCell::new(None));
 
@@ -270,7 +311,14 @@ pub fn setup(
     ui.set_rules(ModelRc::new(rules_model.clone()));
     ui.set_runs(ModelRc::new(runs_model.clone()));
 
-    refresh_rules(ui, &store, &catalog, &engine, &rules_model);
+    refresh_rules(
+        ui,
+        &store,
+        &catalog,
+        &engine,
+        &rules_model,
+        &rules_signature,
+    );
 
     // --- Add ---
     {
@@ -381,6 +429,7 @@ pub fn setup(
         let catalog = catalog.clone();
         let opts = opts.clone();
         let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_save_rule(move || {
             let Some(ui) = weak.upgrade() else { return };
             let shell = match build_shell(&ui, &opts) {
@@ -448,7 +497,14 @@ pub fn setup(
             engine.reload_rule(rule.id);
             ui.set_edit_error("".into());
             ui.set_active_view(0);
-            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+            refresh_rules(
+                &ui,
+                &store,
+                &catalog,
+                &engine,
+                &rules_model,
+                &rules_signature,
+            );
         });
     }
 
@@ -470,6 +526,7 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_request_delete(move |id| {
             let Some(ui) = weak.upgrade() else { return };
             let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
@@ -485,7 +542,14 @@ pub fn setup(
             }
             let _ = store.delete_rule(uuid);
             engine.remove_rule(uuid);
-            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+            refresh_rules(
+                &ui,
+                &store,
+                &catalog,
+                &engine,
+                &rules_model,
+                &rules_signature,
+            );
         });
     }
 
@@ -503,6 +567,7 @@ pub fn setup(
             // skipped because an instance is already running, say so instead of
             // silently doing nothing.
             let notice = match store.get_rule(uuid) {
+                Ok(Some(r)) if !r.enabled => "Rule is disabled",
                 Ok(Some(r))
                     if r.last_status == LastStatus::Running && r.overlap == OverlapPolicy::Skip =>
                 {
@@ -525,6 +590,7 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_request_toggle_enabled(move |id, enabled| {
             let Some(ui) = weak.upgrade() else { return };
             let Ok(uuid) = Uuid::parse_str(id.as_str()) else {
@@ -532,7 +598,14 @@ pub fn setup(
             };
             let _ = store.set_enabled(uuid, enabled);
             engine.reload_rule(uuid);
-            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+            refresh_rules(
+                &ui,
+                &store,
+                &catalog,
+                &engine,
+                &rules_model,
+                &rules_signature,
+            );
         });
     }
 
@@ -558,7 +631,7 @@ pub fn setup(
             ui.set_logs_rule_name(name.into());
             ui.set_selected_run_index(0);
             let rows = build_run_rows(&store, uuid);
-            *runs_signature.borrow_mut() = run_signature(&rows);
+            *runs_signature.borrow_mut() = Some(run_signature(&rows));
             runs_model.set_vec(rows);
             fill_selected_run(&store, &ui, &runs_model);
             ui.set_active_view(2);
@@ -657,6 +730,7 @@ pub fn setup(
         let engine = engine.clone();
         let catalog = catalog.clone();
         let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         ui.on_import_rules(move || {
             let Some(ui) = weak.upgrade() else { return };
             if let Some(path) = rfd::FileDialog::new()
@@ -681,7 +755,14 @@ pub fn setup(
                                 }
                             }
                             engine.reload_all();
-                            refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+                            refresh_rules(
+                                &ui,
+                                &store,
+                                &catalog,
+                                &engine,
+                                &rules_model,
+                                &rules_signature,
+                            );
                             let msg = if skipped > 0 {
                                 format!("Imported {imported} rules ({skipped} invalid skipped).")
                             } else {
@@ -740,6 +821,7 @@ pub fn setup(
         let catalog = catalog.clone();
         let current = current_logs_rule.clone();
         let rules_model = rules_model.clone();
+        let rules_signature = rules_signature.clone();
         let runs_model = runs_model.clone();
         let runs_signature = runs_signature.clone();
         let notice_until = notice_until.clone();
@@ -757,7 +839,14 @@ pub fn setup(
                 }
                 let view = ui.get_active_view();
                 if view == 0 {
-                    refresh_rules(&ui, &store, &catalog, &engine, &rules_model);
+                    refresh_rules(
+                        &ui,
+                        &store,
+                        &catalog,
+                        &engine,
+                        &rules_model,
+                        &rules_signature,
+                    );
                 } else {
                     // keep the paused indicator fresh everywhere
                     ui.set_paused(engine.is_paused());
@@ -769,8 +858,8 @@ pub fn setup(
                     let signature = run_signature(&rows);
                     // Only rebuild when the list actually changed, so the selected
                     // run's captured output is not wiped every second.
-                    if *runs_signature.borrow() != signature {
-                        *runs_signature.borrow_mut() = signature;
+                    if *runs_signature.borrow() != Some(signature) {
+                        *runs_signature.borrow_mut() = Some(signature);
                         runs_model.set_vec(rows);
                     }
                     fill_selected_run(&store, &ui, &runs_model);
