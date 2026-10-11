@@ -44,9 +44,9 @@ project itself is pure Rust:
 
 ```bash
 npm run serve           # build and run the app (cargo run)
-npm run fix             # auto-format + auto-fix lints (cargo fmt, cargo clippy --fix)
-npm run build           # full check: clippy -D warnings + release tests + release build
-npm run re-install-npm  # clean rebuild (cargo clean && cargo build)
+npm run fix              # auto-format + auto-fix lints (cargo fmt, cargo clippy --fix)
+npm run build            # full check: clippy -D warnings + release tests + release build
+npm run re-install-deps  # clean rebuild (cargo clean && cargo build)
 ```
 
 The repo ships Git hooks (`.husky/`) that reject accidental files and enforce

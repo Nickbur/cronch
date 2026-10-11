@@ -14,3 +14,5 @@ sent anywhere: everything stays on your own computer.
 
 Cronch is free for everyone, anyone can look at how it is made, and it is made by burakov. This
 repository holds the complete app, everything that makes up Cronch for Windows and Mac.
+
+Guides and help: [docs.burakov.net/cronch](https://docs.burakov.net/cronch).

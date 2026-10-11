@@ -19,6 +19,30 @@ use uuid::Uuid;
 /// Date/time format of the editor's "Once" field (local time).
 const ONCE_FORMAT: &str = "%Y-%m-%d %H:%M";
 
+/// Cronch's user guide.
+const DOCS_URL: &str = "https://docs.burakov.net/cronch";
+
+/// Open a URL in the system's default browser. A failure is logged, never fatal.
+fn open_url(url: &str) {
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW so opening the browser never flashes a console window.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    if let Err(e) = result {
+        log::error!("cannot open {url}: {e}");
+    }
+}
+
 struct ShellOptions {
     labels: Vec<SharedString>,
     keys: Vec<String>,
@@ -899,6 +923,11 @@ pub fn setup(
                 ui.set_show_first_run(false);
             }
         });
+    }
+
+    // --- Open the user guide ---
+    {
+        ui.on_open_docs(|| open_url(DOCS_URL));
     }
 
     // --- Periodic refresh (live statuses + logs) ---

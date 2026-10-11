@@ -91,6 +91,7 @@ export component MainWindow inherits Window {
     callback pause-all();
     callback resume-all();
     callback dismiss-first-run();
+    callback open-docs();
 
     VerticalLayout {
         // ===== Header =====
@@ -403,6 +404,11 @@ export component MainWindow inherits Window {
                     Text { text: root.settings-status; color: #43c06a; vertical-alignment: center; }
                 }
                 Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button { text: "Documentation"; clicked => { root.open-docs(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                }
                 Text {
                     text: "Cronch — open-source task scheduler · made by burakov · burakov.net";
                     color: #666;
