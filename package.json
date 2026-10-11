@@ -2,6 +2,7 @@
     "name": "cronch",
     "private": true,
     "version": "1.0.0",
+    "license": "MIT OR Apache-2.0",
     "type": "module",
     "description": "Command list for the Cronch Rust project — a convenience wrapper around cargo.",
     "scripts": {
