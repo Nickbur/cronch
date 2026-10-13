@@ -15,7 +15,7 @@ export struct RuleRow {
 export struct RunRow {
     id: string,
     started: string,
-    finished: string,
+    duration: string,
     status: string,
     exit-code: string,
     trigger: string,
@@ -344,7 +344,7 @@ export component MainWindow inherits Window {
                                         : #a0a0a8;
                                     font-weight: 600;
                                 }
-                                Text { text: "exit " + run.exit-code + "  ·  " + run.trigger; color: #77777f; font-size: 11px; }
+                                Text { text: "exit " + run.exit-code + "  ·  " + run.trigger + (run.duration != "" ? "  ·  took " + run.duration : ""); color: #77777f; font-size: 11px; }
                             }
                         }
                     }

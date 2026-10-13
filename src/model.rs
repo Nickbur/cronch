@@ -378,6 +378,16 @@ impl Rule {
         }
     }
 
+    /// For a one-time rule: whether its single occurrence is still to come,
+    /// i.e. no run has started at or after its time. A manual run before that
+    /// time does not use the occurrence up. Always false for other schedules.
+    pub fn once_pending(&self) -> bool {
+        match self.schedule {
+            Schedule::Once { at } => self.last_run.is_none_or(|t| t < at),
+            _ => false,
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("Name must not be empty".into());
@@ -712,5 +722,26 @@ mod tests {
             LastStatus::Cancelled
         );
         assert_eq!(LastStatus::from_str_lossy("unknown"), LastStatus::Never);
+        assert_eq!(LastStatus::from_str_lossy("Skipped"), LastStatus::Skipped);
+    }
+
+    #[test]
+    fn once_occurrence_is_used_up_only_by_a_run_at_or_after_its_time() {
+        let at = Utc.with_ymd_and_hms(2030, 1, 1, 9, 0, 0).unwrap();
+        let mut r = Rule::new(
+            "n".into(),
+            "c".into(),
+            ShellKind::Direct,
+            Schedule::Once { at },
+        );
+        assert!(r.once_pending(), "never ran");
+        r.last_run = Some(at - chrono::Duration::hours(1));
+        assert!(r.once_pending(), "a manual run before the time");
+        r.last_run = Some(at);
+        assert!(!r.once_pending(), "ran at its time");
+        r.last_run = Some(at + chrono::Duration::minutes(30));
+        assert!(!r.once_pending(), "ran later (catch-up or by hand)");
+        r.schedule = Schedule::Interval { seconds: 60 };
+        assert!(!r.once_pending(), "not a one-time rule");
     }
 }

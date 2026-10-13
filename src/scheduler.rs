@@ -38,6 +38,29 @@ fn is_late(due: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     now - due > LATE_GRACE
 }
 
+/// Why an occurrence was skipped, as recorded in its history row.
+const SKIP_BUSY: &str = "the previous run was still going";
+const SKIP_MISSED: &str = "it was missed (Cronch wasn't running or the computer was asleep) and Catch up if missed is off";
+const SKIP_PAUSED: &str = "it came due while everything was paused and Catch up if missed is off";
+const SKIP_QUEUE_FULL: &str = "a run was already waiting in the queue";
+const SKIP_QUEUED_OFF: &str = "it was waiting in the queue and the rule was switched off";
+const SKIP_QUEUED_PAUSED: &str = "it was waiting in the queue and everything was paused";
+const SKIP_QUEUED_QUIT: &str = "it was waiting in the queue and Cronch quit";
+
+/// Record an occurrence that did not run in the rule's history (status
+/// `Skipped`, the reason in stderr) and in the log.
+fn record_skip(store: &Store, rule: &Rule, due: DateTime<Utc>, trigger: &str, reason: &str) {
+    log::info!("skipped a run of '{}' (due {due}): {reason}", rule.name);
+    if let Err(e) = store.record_skipped(
+        rule.id,
+        due,
+        trigger,
+        &format!("cronch: skipped — {reason}"),
+    ) {
+        log::error!("record_skipped failed: {e}");
+    }
+}
+
 pub enum Ctrl {
     /// Load all rules at boot: missed runs catch up per rule.
     StartupLoad,
@@ -202,18 +225,20 @@ impl Engine {
                         }
                 };
                 // The fire time that already passed, if the rule is firing now
-                // to make up for it.
+                // to make up for it, or else if that time is skipped.
                 let mut missed = None;
+                let mut skipped = None;
                 let next = match &rule.schedule {
                     Schedule::Once { at } => {
                         if *at > now {
                             Some(*at)
-                        } else if rule.last_run.is_none() {
-                            // Never ran: its one occurrence was missed.
+                        } else if rule.once_pending() {
+                            // Its one occurrence passed without a run: missed.
                             if fire_now(*at) {
                                 missed = Some(*at);
                                 Some(now)
                             } else {
+                                skipped = Some(*at);
                                 expired = true;
                                 None
                             }
@@ -230,7 +255,10 @@ impl Engine {
                                 missed = Some(t);
                                 Some(now)
                             }
-                            Some(t) => next_interval_tick(t, *seconds, now),
+                            Some(t) => {
+                                skipped = Some(t);
+                                next_interval_tick(t, *seconds, now)
+                            }
                             None => add_secs(now, *seconds),
                         }
                     }
@@ -243,12 +271,30 @@ impl Engine {
                                 missed = Some(t);
                                 Some(now)
                             }
-                            _ => rule.schedule.next_after(now),
+                            Some(t) => {
+                                skipped = Some(t);
+                                rule.schedule.next_after(now)
+                            }
+                            None => rule.schedule.next_after(now),
                         }
                     }
                 };
                 if let Some(t) = missed {
                     self.catching_up.insert(id, t);
+                }
+                // Startup and resume record what they skip (a backlog as one
+                // row, at its first missed time). A reload never fires for the
+                // past, so what it passes over was not missed.
+                if let Some(t) = skipped {
+                    let reason = match mode {
+                        Missed::Reload => None,
+                        _ if busy => Some(SKIP_BUSY),
+                        Missed::Startup => Some(SKIP_MISSED),
+                        Missed::Resume => Some(SKIP_PAUSED),
+                    };
+                    if let Some(reason) = reason {
+                        record_skip(&self.store, &rule, t, "schedule", reason);
+                    }
                 }
                 next
             }
@@ -303,16 +349,13 @@ impl Engine {
     }
 
     /// A missed occurrence of a rule without catch-up: skip it. A one-time
-    /// rule that never ran is then expired.
+    /// rule whose occurrence this was is then expired.
     fn skip_missed(&mut self, id: Uuid, due: DateTime<Utc>) {
         let Some(rule) = self.rules.get_mut(&id) else {
             return;
         };
-        log::info!(
-            "skipping missed run of '{}' (was due {due}, catch-up is off)",
-            rule.name
-        );
-        if matches!(rule.schedule, Schedule::Once { .. }) && rule.last_run.is_none() {
+        record_skip(&self.store, rule, due, "schedule", SKIP_MISSED);
+        if rule.once_pending() {
             rule.last_status = LastStatus::Expired;
             let _ = self.store.set_status(id, LastStatus::Expired);
         }
@@ -330,11 +373,14 @@ impl Engine {
             match rule.overlap {
                 OverlapPolicy::Skip => {
                     // The rule keeps showing "Running" for the run in flight.
-                    log::info!("skip overlapping run for '{}'", rule.name);
+                    record_skip(&self.store, &rule, Utc::now(), trigger, SKIP_BUSY);
                     return;
                 }
                 OverlapPolicy::Queue => {
-                    self.pending.insert(id);
+                    // At most one run waits per rule; a further one is skipped.
+                    if !self.pending.insert(id) {
+                        record_skip(&self.store, &rule, Utc::now(), trigger, SKIP_QUEUE_FULL);
+                    }
                     return;
                 }
                 OverlapPolicy::Parallel => {}
@@ -382,6 +428,16 @@ impl Engine {
                 })
                 .await;
         });
+    }
+
+    /// Drop every queued run, recording each in its rule's history as skipped.
+    fn drop_queued(&mut self, reason: &str) {
+        let now = Utc::now();
+        for id in std::mem::take(&mut self.pending) {
+            if let Some(rule) = self.rules.get(&id) {
+                record_skip(&self.store, rule, now, "queued", reason);
+            }
+        }
     }
 
     /// Decrement the in-flight counter for a rule; returns whether other
@@ -442,13 +498,21 @@ impl Engine {
                 outcome.exit_code
             );
             // A queued run was requested while a run was in flight. It only
-            // starts if the rule is still enabled and nothing is paused.
+            // starts if the rule is still enabled and nothing is paused;
+            // otherwise it is dropped and recorded as skipped.
             if self.pending.remove(&rule_id) {
                 match self.rules.get(&rule_id).cloned() {
                     Some(rule) if rule.enabled && !self.paused.load(Ordering::Relaxed) => {
                         self.spawn_job(rule, "queued");
                     }
-                    Some(rule) => log::info!("dropped queued run of '{}'", rule.name),
+                    Some(rule) => {
+                        let reason = if rule.enabled {
+                            SKIP_QUEUED_PAUSED
+                        } else {
+                            SKIP_QUEUED_OFF
+                        };
+                        record_skip(&self.store, &rule, Utc::now(), "queued", reason);
+                    }
                     None => {}
                 }
             }
@@ -535,7 +599,7 @@ impl Engine {
                 self.set_paused(true);
                 // Paused: no scheduled or queued run starts (an explicit
                 // "Run now" still does).
-                self.pending.clear();
+                self.drop_queued(SKIP_QUEUED_PAUSED);
                 log::info!("paused all rules");
             }
             Ctrl::ResumeAll => {
@@ -611,7 +675,7 @@ impl Engine {
     /// After the shutdown broadcast, wait (bounded) for in-flight jobs to
     /// report back so their run rows are closed instead of left dangling.
     async fn drain(&mut self, jobdone_rx: &mut mpsc::Receiver<JobDone>) {
-        self.pending.clear();
+        self.drop_queued(SKIP_QUEUED_QUIT);
         let deadline = tokio::time::Instant::now() + StdDuration::from_secs(5);
         while !self.running.is_empty() {
             let now = tokio::time::Instant::now();
@@ -702,7 +766,7 @@ pub fn create(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ShellKind;
+    use crate::model::{RunRecord, ShellKind};
 
     #[cfg(windows)]
     const LONG_CMD: &str = "cmd /C \"ping -n 60 127.0.0.1 >NUL\"";
@@ -743,6 +807,21 @@ mod tests {
 
     fn rule(cmd: &str, schedule: Schedule) -> Rule {
         Rule::new("t".into(), cmd.into(), ShellKind::Direct, schedule)
+    }
+
+    /// The rule's history, split into runs that started and skipped
+    /// occurrences (the latter with their stderr reason loaded).
+    fn runs_and_skips(store: &Store, rule_id: Uuid) -> (Vec<RunRecord>, Vec<RunRecord>) {
+        let (runs, skips): (Vec<_>, Vec<_>) = store
+            .list_runs(rule_id, 50)
+            .unwrap()
+            .into_iter()
+            .partition(|r| r.status != Some(LastStatus::Skipped));
+        let skips = skips
+            .into_iter()
+            .map(|r| store.get_run(r.id).unwrap().unwrap())
+            .collect();
+        (runs, skips)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -817,11 +896,10 @@ mod tests {
         // (Parallel) run starts right now.
         handle.resume_all();
         tokio::time::sleep(StdDuration::from_millis(500)).await;
-        assert_eq!(
-            store.list_runs(rule.id, 10).unwrap().len(),
-            1,
-            "a busy rule must not catch up on resume"
-        );
+        let (runs, skips) = runs_and_skips(&store, rule.id);
+        assert_eq!(runs.len(), 1, "a busy rule must not catch up on resume");
+        assert_eq!(skips.len(), 1, "the passed-over occurrence is recorded");
+        assert!(skips[0].stderr.contains(SKIP_BUSY));
 
         stop(handle, jh).await;
     }
@@ -883,16 +961,51 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(500)).await;
         stop(handle, jh).await;
 
+        let (runs, skips) = runs_and_skips(&store, rule.id);
         assert!(
-            store.list_runs(rule.id, 10).unwrap().is_empty(),
+            runs.is_empty(),
             "a missed run must be skipped when catch-up is off"
         );
+        assert_eq!(skips.len(), 1, "the skip is recorded in the history");
+        assert_eq!(skips[0].started_at, due, "at the time it was due");
+        assert_eq!(skips[0].trigger, "schedule");
+        assert!(skips[0].stderr.contains(SKIP_MISSED));
         let got = store.get_rule(rule.id).unwrap().unwrap();
         assert_eq!(
             got.next_run,
             Some(due + ChronoDuration::hours(1)),
             "the next run keeps the rule's phase"
         );
+        assert_eq!(got.last_status, LastStatus::Never, "a skip is not a run");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resume_records_an_occurrence_skipped_by_the_pause() {
+        let store = Store::open_in_memory().unwrap();
+        store.setting_set(PAUSED_SETTING, "1").unwrap();
+        let mut rule = rule(ECHO_CMD, Schedule::Interval { seconds: 3600 });
+        rule.catch_up = false;
+        // Due just before this start, so it is on time, but everything is
+        // paused until the resume below.
+        let due = Utc::now() - ChronoDuration::seconds(30);
+        rule.next_run = Some(due);
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, jh) = start(&store);
+        handle.startup_load();
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        handle.resume_all();
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        stop(handle, jh).await;
+
+        let (runs, skips) = runs_and_skips(&store, rule.id);
+        assert!(
+            runs.is_empty(),
+            "without catch-up the paused occurrence is skipped"
+        );
+        assert_eq!(skips.len(), 1);
+        assert_eq!(skips[0].started_at, due);
+        assert!(skips[0].stderr.contains(SKIP_PAUSED));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -981,14 +1094,62 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missed_once_without_catch_up_expires() {
+        let at = Utc::now() - ChronoDuration::hours(1);
+        // Never ran, and ran manually before its time: either way its one
+        // occurrence was missed.
+        for last_run in [None, Some(at - ChronoDuration::hours(1))] {
+            let store = Store::open_in_memory().unwrap();
+            let mut rule = rule(ECHO_CMD, Schedule::Once { at });
+            rule.catch_up = false;
+            rule.last_run = last_run;
+            rule.next_run = Some(at);
+            store.upsert_rule(&rule).unwrap();
+
+            let (handle, jh) = start(&store);
+            handle.startup_load();
+            tokio::time::sleep(StdDuration::from_millis(500)).await;
+            stop(handle, jh).await;
+
+            let (runs, skips) = runs_and_skips(&store, rule.id);
+            assert!(runs.is_empty());
+            assert_eq!(skips.len(), 1, "the missed occurrence is recorded");
+            assert_eq!(skips[0].started_at, at);
+            let got = store.get_rule(rule.id).unwrap().unwrap();
+            assert_eq!(got.last_status, LastStatus::Expired);
+            assert_eq!(got.next_run, None);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_run_does_not_use_up_a_once_occurrence() {
         let store = Store::open_in_memory().unwrap();
-        let mut rule = rule(
-            ECHO_CMD,
-            Schedule::Once {
-                at: Utc::now() - ChronoDuration::hours(1),
-            },
-        );
-        rule.catch_up = false;
+        // Run by hand an hour before its time, then the time passed while the
+        // app was off.
+        let at = Utc::now() - ChronoDuration::minutes(90);
+        let mut rule = rule(ECHO_CMD, Schedule::Once { at });
+        rule.last_run = Some(at - ChronoDuration::hours(1));
+        rule.next_run = Some(at);
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, jh) = start(&store);
+        handle.startup_load();
+        wait_for_runs(&store, rule.id, 1).await;
+        stop(handle, jh).await;
+
+        let runs = store.list_runs(rule.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, "catch-up");
+        let got = store.get_rule(rule.id).unwrap().unwrap();
+        assert_eq!(got.next_run, None, "the occurrence is now used up");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn once_that_ran_at_its_time_stays_done() {
+        let store = Store::open_in_memory().unwrap();
+        let at = Utc::now() - ChronoDuration::minutes(90);
+        let mut rule = rule(ECHO_CMD, Schedule::Once { at });
+        rule.last_run = Some(at);
+        rule.last_status = LastStatus::Success;
         store.upsert_rule(&rule).unwrap();
 
         let (handle, jh) = start(&store);
@@ -998,7 +1159,8 @@ mod tests {
 
         assert!(store.list_runs(rule.id, 10).unwrap().is_empty());
         let got = store.get_rule(rule.id).unwrap().unwrap();
-        assert_eq!(got.last_status, LastStatus::Expired);
+        assert_eq!(got.last_status, LastStatus::Success);
+        assert_eq!(got.next_run, None);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1038,10 +1200,72 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(2000)).await;
         stop(handle, jh).await;
 
+        let (runs, skips) = runs_and_skips(&store, rule.id);
+        assert_eq!(runs.len(), 1, "the queued run must not start while paused");
+        assert_eq!(skips.len(), 1, "the dropped run is recorded");
+        assert_eq!(skips[0].trigger, "queued");
+        assert!(skips[0].stderr.contains(SKIP_QUEUED_PAUSED));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_run_is_dropped_when_the_rule_is_switched_off() {
+        let store = Store::open_in_memory().unwrap();
+        let mut rule = rule("sleep 1", Schedule::Interval { seconds: 3600 });
+        rule.overlap = OverlapPolicy::Queue;
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, jh) = start(&store);
+        handle.run_now(rule.id);
+        wait_for_runs(&store, rule.id, 1).await;
+        handle.run_now(rule.id); // queued behind the first run
+        // Let the engine queue it before the rule is switched off in the store.
+        tokio::time::sleep(StdDuration::from_millis(200)).await;
+        rule.enabled = false;
+        store.upsert_rule(&rule).unwrap();
+        handle.reload_rule(rule.id);
+        tokio::time::sleep(StdDuration::from_millis(2000)).await;
+        stop(handle, jh).await;
+
+        let (runs, skips) = runs_and_skips(&store, rule.id);
         assert_eq!(
-            store.list_runs(rule.id, 10).unwrap().len(),
+            runs.len(),
             1,
-            "the queued run must not start while paused"
+            "a switched-off rule's queued run must not start"
+        );
+        assert_eq!(skips.len(), 1, "the dropped run is recorded");
+        assert_eq!(skips[0].trigger, "queued");
+        assert!(skips[0].stderr.contains(SKIP_QUEUED_OFF));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queue_holds_one_run_and_records_the_rest() {
+        let store = Store::open_in_memory().unwrap();
+        let mut rule = rule(LONG_CMD, Schedule::Interval { seconds: 3600 });
+        rule.timeout_secs = 0;
+        rule.overlap = OverlapPolicy::Queue;
+        store.upsert_rule(&rule).unwrap();
+
+        let (handle, jh) = start(&store);
+        handle.run_now(rule.id);
+        wait_for_runs(&store, rule.id, 1).await;
+        handle.run_now(rule.id); // waits in the queue
+        handle.run_now(rule.id); // the queue is full: skipped
+        tokio::time::sleep(StdDuration::from_millis(300)).await;
+        let (runs, skips) = runs_and_skips(&store, rule.id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(skips.len(), 1, "only the run beyond the queue is skipped");
+        assert_eq!(skips[0].trigger, "manual");
+        assert!(skips[0].stderr.contains(SKIP_QUEUE_FULL));
+
+        // Quitting drops the run still waiting in the queue.
+        stop(handle, jh).await;
+        let (_, skips) = runs_and_skips(&store, rule.id);
+        assert_eq!(skips.len(), 2);
+        assert!(
+            skips
+                .iter()
+                .any(|s| s.trigger == "queued" && s.stderr.contains(SKIP_QUEUED_QUIT))
         );
     }
 
@@ -1090,7 +1314,11 @@ mod tests {
         tokio::time::sleep(StdDuration::from_millis(300)).await;
         let got = store.get_rule(rule.id).unwrap().unwrap();
         assert_eq!(got.last_status, LastStatus::Running);
-        assert_eq!(store.list_runs(rule.id, 10).unwrap().len(), 1);
+        let (runs, skips) = runs_and_skips(&store, rule.id);
+        assert_eq!(runs.len(), 1);
+        assert_eq!(skips.len(), 1, "the skipped run is recorded");
+        assert_eq!(skips[0].trigger, "manual");
+        assert!(skips[0].stderr.contains(SKIP_BUSY));
         stop(handle, jh).await;
     }
 }

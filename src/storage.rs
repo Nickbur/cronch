@@ -304,6 +304,31 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Record an occurrence that did not run: a closed row with status
+    /// `Skipped`, starting and finishing at `due`, with the reason in stderr.
+    pub fn record_skipped(
+        &self,
+        rule_id: Uuid,
+        due: DateTime<Utc>,
+        trigger: &str,
+        reason: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let due = dt_to_str(&due);
+        conn.execute(
+            "INSERT INTO runs (rule_id, started_at, finished_at, success, trigger, status, stderr)
+             VALUES (?1, ?2, ?2, 0, ?3, ?4, ?5)",
+            params![
+                rule_id.to_string(),
+                due,
+                trigger,
+                LastStatus::Skipped.as_str(),
+                reason
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Close a run row with its outcome; `success` is derived from `status`.
     pub fn finish_run(
         &self,
@@ -606,6 +631,32 @@ mod tests {
         let run = store.get_run(run_id).unwrap().unwrap();
         assert_eq!(run.status, Some(LastStatus::TimedOut));
         assert!(!run.success, "a timed-out run is not a success");
+    }
+
+    #[test]
+    fn skipped_occurrence_is_a_closed_row() {
+        let store = Store::open_in_memory().unwrap();
+        let rule = Rule::new(
+            "r".into(),
+            "echo".into(),
+            ShellKind::Direct,
+            Schedule::Interval { seconds: 5 },
+        );
+        store.upsert_rule(&rule).unwrap();
+        let due = Utc::now() - chrono::Duration::minutes(10);
+        store
+            .record_skipped(rule.id, due, "schedule", "cronch: skipped (why)")
+            .unwrap();
+        let runs = store.list_runs(rule.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        let run = store.get_run(runs[0].id).unwrap().unwrap();
+        assert_eq!(run.status, Some(LastStatus::Skipped));
+        assert_eq!(run.started_at, due);
+        assert_eq!(run.finished_at, Some(due), "closed, so retention prunes it");
+        assert!(!run.success);
+        assert_eq!(run.exit_code, None);
+        assert_eq!(run.trigger, "schedule");
+        assert_eq!(run.stderr, "cronch: skipped (why)");
     }
 
     #[test]

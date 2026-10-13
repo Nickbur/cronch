@@ -76,6 +76,42 @@ fn first_existing(paths: &[&str]) -> Option<PathBuf> {
         .map(|p| p.to_path_buf())
 }
 
+/// The Git for Windows install that `exe` (a `git.exe` or `bash.exe` found on
+/// PATH) belongs to, if any. Git puts `<root>\cmd`, `<root>\bin`,
+/// `<root>\usr\bin` or `<root>\mingw64\bin` on PATH, so the root is one or two
+/// levels above the binary's folder; it is recognised by its own `git.exe`
+/// and `bash.exe`. `C:\Windows\System32\bash.exe` (the WSL launcher) has no
+/// such root.
+#[cfg(any(windows, test))]
+fn git_install_root(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .skip(2)
+        .take(2)
+        .find(|root| {
+            root.join("cmd").join("git.exe").is_file()
+                && root.join("bin").join("bash.exe").is_file()
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Git Bash: a standard install, else the Git install that `git.exe` or
+/// `bash.exe` on PATH belongs to. A `bash.exe` from anywhere else is never
+/// taken, so WSL is not offered as Git Bash.
+#[cfg(windows)]
+fn find_git_bash(path: Option<&OsStr>) -> Option<PathBuf> {
+    first_existing(&[
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ])
+    .or_else(|| {
+        ["git.exe", "bash.exe"]
+            .into_iter()
+            .filter_map(|program| which(path, program))
+            .find_map(|exe| git_install_root(&exe))
+            .map(|root| root.join("bin").join("bash.exe"))
+    })
+}
+
 #[cfg(windows)]
 fn detect_platform(path: Option<&OsStr>) -> Vec<ShellInfo> {
     let mut out = Vec::new();
@@ -122,12 +158,7 @@ fn detect_platform(path: Option<&OsStr>) -> Vec<ShellInfo> {
     }
 
     // Git Bash
-    if let Some(p) = first_existing(&[
-        "C:\\Program Files\\Git\\bin\\bash.exe",
-        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-    ])
-    .or_else(|| which(path, "bash.exe"))
-    {
+    if let Some(p) = find_git_bash(path) {
         out.push(ShellInfo {
             key: "gitbash".into(),
             label: "Git Bash".into(),
@@ -180,4 +211,40 @@ fn detect_platform(path: Option<&OsStr>) -> Vec<ShellInfo> {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Create an empty file (and its folders) at `root/parts…`.
+    fn touch(root: &Path, parts: &[&str]) -> PathBuf {
+        let path = parts
+            .iter()
+            .fold(root.to_path_buf(), |p, part| p.join(part));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        path
+    }
+
+    #[test]
+    fn git_bash_only_comes_from_a_git_install() {
+        let dir = std::env::temp_dir().join(format!("cronch-shell-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let git = dir.join("Git");
+        let on_path = [
+            touch(&git, &["cmd", "git.exe"]),
+            touch(&git, &["bin", "bash.exe"]),
+            touch(&git, &["usr", "bin", "bash.exe"]),
+        ];
+        let wsl_bash = touch(&dir, &["Windows", "System32", "bash.exe"]);
+
+        let roots = on_path.map(|exe| git_install_root(&exe));
+        let wsl_root = git_install_root(&wsl_bash);
+        let _ = std::fs::remove_dir_all(&dir);
+        for root in roots {
+            assert_eq!(root.as_deref(), Some(git.as_path()));
+        }
+        assert_eq!(wsl_root, None, "WSL's bash.exe is not Git Bash");
+    }
 }

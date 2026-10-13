@@ -2,7 +2,7 @@
 
 use crate::autostart;
 use crate::model::{
-    EnvVar, LastStatus, MAX_TIMEOUT_SECS, OverlapPolicy, Rule, Schedule, ShellKind,
+    EnvVar, LastStatus, MAX_TIMEOUT_SECS, OverlapPolicy, Rule, RunRecord, Schedule, ShellKind,
 };
 use crate::scheduler::EngineHandle;
 use crate::shell::ShellCatalog;
@@ -89,6 +89,23 @@ fn fmt_dt(dt: Option<DateTime<Utc>>, fmt: &str) -> String {
     }
 }
 
+/// How long a finished run took: "<1s", "42s", "3m 05s" or "2h 07m". Empty
+/// for a run still going and for a skipped occurrence (it never ran).
+fn fmt_run_duration(r: &RunRecord) -> String {
+    let Some(finished) = r.finished_at else {
+        return String::new();
+    };
+    if r.status == Some(LastStatus::Skipped) {
+        return String::new();
+    }
+    match (finished - r.started_at).num_seconds().max(0) {
+        0 => "<1s".into(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {:02}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
 fn build_rule_rows(store: &Store, catalog: &ShellCatalog) -> Vec<RuleRow> {
     store
         .list_rules()
@@ -137,7 +154,7 @@ fn build_run_rows(store: &Store, rule_id: Uuid) -> Vec<RunRow> {
                     .format("%m-%d %H:%M:%S")
                     .to_string()
                     .into(),
-                finished: fmt_dt(r.finished_at, "%H:%M:%S").into(),
+                duration: fmt_run_duration(&r).into(),
                 status: status.into(),
                 exit_code: r
                     .exit_code
@@ -164,7 +181,7 @@ fn run_signature(rows: &[RunRow]) -> u64 {
     for r in rows {
         r.id.as_str().hash(&mut h);
         r.started.as_str().hash(&mut h);
-        r.finished.as_str().hash(&mut h);
+        r.duration.as_str().hash(&mut h);
         r.status.as_str().hash(&mut h);
         r.exit_code.as_str().hash(&mut h);
         r.success.hash(&mut h);
@@ -989,4 +1006,44 @@ pub fn setup(
         );
     }
     timer
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(secs: Option<i64>, status: Option<LastStatus>) -> RunRecord {
+        let started = Utc::now();
+        RunRecord {
+            id: 1,
+            started_at: started,
+            finished_at: secs.map(|s| started + chrono::Duration::seconds(s)),
+            exit_code: None,
+            success: false,
+            status,
+            stdout: String::new(),
+            stderr: String::new(),
+            trigger: "schedule".into(),
+        }
+    }
+
+    #[test]
+    fn run_duration_is_short_and_readable() {
+        let done = Some(LastStatus::Success);
+        assert_eq!(fmt_run_duration(&run(Some(0), done)), "<1s");
+        assert_eq!(fmt_run_duration(&run(Some(42), done)), "42s");
+        assert_eq!(fmt_run_duration(&run(Some(185), done)), "3m 05s");
+        assert_eq!(fmt_run_duration(&run(Some(7620), done)), "2h 07m");
+        assert_eq!(
+            fmt_run_duration(&run(Some(-5), done)),
+            "<1s",
+            "clock moved back"
+        );
+        assert_eq!(fmt_run_duration(&run(None, None)), "", "still going");
+        assert_eq!(
+            fmt_run_duration(&run(Some(0), Some(LastStatus::Skipped))),
+            "",
+            "a skipped occurrence never ran"
+        );
+    }
 }
